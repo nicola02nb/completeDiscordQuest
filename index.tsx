@@ -41,11 +41,18 @@ export default definePlugin({
                 replace: "$&$self.renderQuestButtonSettingsBar(),"
             }
         },
-        {
+        { // PTB Experimental
             find: "\"innerRef\",\"navigate\",\"onClick\"",
             replacement: {
                 match: /(\i).createElement\("a",(\i)\)/,
                 replace: "$1.createElement(\"a\",$self.renderQuestButtonBadges($2))"
+            }
+        },
+        {
+            find: "location:\"GlobalDiscoverySidebar\"",
+            replacement: {
+                match: /(\(\i\){let{tab:(\i)}=.{0,1500}children:\i}\))(]}\))/,
+                replace: "$1,$self.renderQuestButtonBadges($2)$3"
             }
         },
         {
@@ -92,7 +99,11 @@ export default definePlugin({
     },
 
     renderQuestButtonBadges(questButton) {
-        if (settings.store.showQuestsButtonBadges && questButton?.href.startsWith("/quest-home") && Array.isArray(questButton?.children)) {
+        if (settings.store.showQuestsButtonBadges && typeof questButton === "string" && questButton === "quests") {
+            return (<QuestsCount />);
+        }
+        // Experiment
+        if (settings.store.showQuestsButtonBadges && questButton?.href?.startsWith("/quest-home") && Array.isArray(questButton?.children)) {
             questButton.children.push(<QuestsCount />);
         }
         return questButton;
