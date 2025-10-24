@@ -52,7 +52,6 @@ export function QuestsCount() {
 
     return (
         <Flex direction={Flex.Direction.HORIZONTAL} justify={Flex.Justify.END} className={"quest-button-badges"}>
-
             {status.enrollable > 0 && (
                 <Tooltip text={"Enrollable"}>
                     {({ onMouseEnter, onMouseLeave }) => (

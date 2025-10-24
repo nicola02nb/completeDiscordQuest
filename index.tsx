@@ -103,7 +103,8 @@ export default definePlugin({
             return (<QuestsCount />);
         }
         // Experiment
-        if (settings.store.showQuestsButtonBadges && questButton?.href?.startsWith("/quest-home") && Array.isArray(questButton?.children)) {
+        if (settings.store.showQuestsButtonBadges && questButton?.href?.startsWith("/quest-home")
+            && Array.isArray(questButton?.children) && questButton.children.findIndex(child => child?.type === QuestsCount) === -1) {
             questButton.children.push(<QuestsCount />);
         }
         return questButton;
@@ -130,7 +131,7 @@ export default definePlugin({
 
 function updateQuests() {
     availableQuests = [...QuestsStore.quests.values()];
-    completableQuests = availableQuests.filter(x => x.id !== "1248385850622869556" && x.userStatus?.enrolledAt && !x.userStatus?.completedAt && new Date(x.config.expiresAt).getTime() > Date.now()) || [];
+    completableQuests = availableQuests.filter(x => /* x.id !== "1248385850622869556" &&  */x.userStatus?.enrolledAt && !x.userStatus?.completedAt && new Date(x.config.expiresAt).getTime() > Date.now()) || [];
     for (const quest of completableQuests) {
         if (completingQuest.has(quest.id)) {
             if (completingQuest.get(quest.id) === false) {
