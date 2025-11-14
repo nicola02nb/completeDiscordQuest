@@ -13,6 +13,7 @@ import settings from "./settings";
 import { ChannelStore, GuildChannelStore, QuestsStore, RunningGameStore } from "./stores";
 
 const { enrollAndStartVideoQuestWithErrorHandling }: { enrollAndStartVideoQuestWithErrorHandling: (quest: QuestValue, action: QuestAction) => Promise<any>; } = findByPropsLazy("enrollAndStartVideoQuestWithErrorHandling");
+const QuestLocationMap: Record<string, any> = findByPropsLazy("QUEST_HOME_DESKTOP", "11");
 
 let availableQuests: QuestValue[] = [];
 let acceptableQuests: QuestValue[] = [];
@@ -157,7 +158,7 @@ function updateQuests() {
 function acceptQuest(quest: QuestValue) {
     if (!settings.store.acceptQuestsAutomatically) return;
     const action: QuestAction = {
-        questContent: 11,
+        questContent: QuestLocationMap.QUEST_HOME_DESKTOP,
         questContentCTA: "ACCEPT_QUEST",
         questContentPosition: 0,
         questContentRowIndex: 0,
