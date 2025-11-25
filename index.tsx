@@ -5,13 +5,18 @@
  */
 
 import definePlugin from "@utils/types";
+import { findByCodeLazy, findByPropsLazy } from "@webpack";
 import { FluxDispatcher, RestAPI } from "@webpack/common";
 
 import { QuestButton, QuestsCount } from "./components/QuestButton";
 import settings from "./settings";
 import { ChannelStore, GuildChannelStore, QuestsStore, RunningGameStore } from "./stores";
 
+const QuestApplyAction = findByCodeLazy("type:\"QUESTS_ENROLL_BEGIN\"") as (questId: string, action: QuestAction) => Promise<any>;
+const QuestLocationMap = findByPropsLazy("QUEST_HOME_DESKTOP", "11") as Record<string, any>;
+
 let availableQuests: QuestValue[] = [];
+let acceptableQuests: QuestValue[] = [];
 let completableQuests: QuestValue[] = [];
 
 const completingQuest = new Map();
@@ -37,15 +42,22 @@ export default definePlugin({
         {
             find: "#{intl::ACCOUNT_SPEAKING_WHILE_MUTED}",
             replacement: {
-                match: /className:\i\.buttons,.{0,50}children:\[/,
+                match: /className:\i\.buttons,.+?children:\[/,
                 replace: "$&$self.renderQuestButtonSettingsBar(),"
             }
         },
-        {
+        { // PTB Experimental
             find: "\"innerRef\",\"navigate\",\"onClick\"",
             replacement: {
                 match: /(\i).createElement\("a",(\i)\)/,
                 replace: "$1.createElement(\"a\",$self.renderQuestButtonBadges($2))"
+            }
+        },
+        {
+            find: "location:\"GlobalDiscoverySidebar\"",
+            replacement: {
+                match: /(\(\i\){let{tab:(\i)}=.+?children:\i}\))(]}\))/,
+                replace: "$1,$self.renderQuestButtonBadges($2)$3"
             }
         },
         {
@@ -92,7 +104,12 @@ export default definePlugin({
     },
 
     renderQuestButtonBadges(questButton) {
-        if (settings.store.showQuestsButtonBadges && questButton?.href.startsWith("/quest-home") && Array.isArray(questButton?.children)) {
+        if (settings.store.showQuestsButtonBadges && typeof questButton === "string" && questButton === "quests") {
+            return (<QuestsCount />);
+        }
+        // Experiment
+        if (settings.store.showQuestsButtonBadges && questButton?.href?.startsWith("/quest-home")
+            && Array.isArray(questButton?.children) && questButton.children.findIndex(child => child?.type === QuestsCount) === -1) {
             questButton.children.push(<QuestsCount />);
         }
         return questButton;
@@ -119,7 +136,11 @@ export default definePlugin({
 
 function updateQuests() {
     availableQuests = [...QuestsStore.quests.values()];
-    completableQuests = availableQuests.filter(x => x.id !== "1248385850622869556" && x.userStatus?.enrolledAt && !x.userStatus?.completedAt && new Date(x.config.expiresAt).getTime() > Date.now()) || [];
+    acceptableQuests = availableQuests.filter(x => x.userStatus?.enrolledAt == null && new Date(x.config.expiresAt).getTime() > Date.now()) || [];
+    completableQuests = availableQuests.filter(x => x.userStatus?.enrolledAt && !x.userStatus?.completedAt && new Date(x.config.expiresAt).getTime() > Date.now()) || [];
+    for (const quest of acceptableQuests) {
+        acceptQuest(quest);
+    }
     for (const quest of completableQuests) {
         if (completingQuest.has(quest.id)) {
             if (completingQuest.get(quest.id) === false) {
@@ -129,7 +150,23 @@ function updateQuests() {
             completeQuest(quest);
         }
     }
+    console.log("Available quests updated:", availableQuests);
+    console.log("Acceptable quests updated:", acceptableQuests);
     console.log("Completable quests updated:", completableQuests);
+}
+
+function acceptQuest(quest: QuestValue) {
+    if (!settings.store.acceptQuestsAutomatically) return;
+    const action: QuestAction = {
+        questContent: QuestLocationMap.QUEST_HOME_DESKTOP,
+        questContentCTA: "ACCEPT_QUEST",
+        sourceQuestContent: 0,
+    };
+    QuestApplyAction(quest.id, action).then(() => {
+        console.log("Accepted quest:", quest.config.messages.questName);
+    }).catch(err => {
+        console.error("Failed to accept quest:", quest.config.messages.questName, err);
+    });
 }
 
 function stopCompletingAll() {

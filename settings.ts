@@ -8,6 +8,11 @@ import { definePluginSettings } from "@api/Settings";
 import { OptionType } from "@utils/types";
 
 export default definePluginSettings({
+    acceptQuestsAutomatically: {
+        type: OptionType.BOOLEAN,
+        description: "Whether to accept available quests automatically.",
+        default: true
+    },
     showQuestsButtonTopBar: {
         type: OptionType.BOOLEAN,
         description: "Whether to show the quests button in the top bar.",

@@ -125,3 +125,12 @@ interface Application {
     name: string;
     link: string;
 }
+
+interface QuestAction {
+    questContent: number;
+    questContentCTA: string;
+    questContentPosition?: number;
+    questContentRowIndex?: number;
+    sourceQuestContent: number;
+    sourceQuestContentCTA?: string;
+}
