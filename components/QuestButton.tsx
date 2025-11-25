@@ -7,7 +7,7 @@
 import "./QuestButton.css";
 
 import { findByCodeLazy, findByPropsLazy, findComponentByCodeLazy } from "@webpack";
-import { Flex, Tooltip, useEffect, useState } from "@webpack/common";
+import { Tooltip, useEffect, useState } from "@webpack/common";
 
 import { QuestsStore } from "../stores";
 
@@ -51,7 +51,7 @@ export function QuestsCount() {
     }, []);
 
     return (
-        <Flex direction={Flex.Direction.HORIZONTAL} justify={Flex.Justify.END} className={"quest-button-badges"}>
+        <div className={"quest-button-badges"} style={{ display: "flex", flexDirection: "row", justifyContent: "flex-end" }}>
 
             {state.enrollable > 0 && (
                 <Tooltip text={"Enrollable"}>
@@ -89,7 +89,7 @@ export function QuestsCount() {
                     )}
                 </Tooltip>
             )}
-        </Flex>
+        </div>
     );
 }
 

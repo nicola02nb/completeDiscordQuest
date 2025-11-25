@@ -4,12 +4,12 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-import { findStoreLazy } from "@webpack";
+import { findByPropsLazy, findStoreLazy } from "@webpack";
 
 import * as t from "./types/stores";
 
 export const ApplicationStreamingStore: t.ApplicationStreamingStore = findStoreLazy("ApplicationStreamingStore");
 export const RunningGameStore: t.RunningGameStore = findStoreLazy("RunningGameStore");
-export const QuestsStore: t.QuestsStore = findStoreLazy("QuestsStore");
+export const QuestsStore: t.QuestsStore = findByPropsLazy("getQuest") as t.QuestsStore;
 export const ChannelStore: t.ChannelStore = findStoreLazy("ChannelStore");
 export const GuildChannelStore: t.GuildChannelStore = findStoreLazy("GuildChannelStore");
