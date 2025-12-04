@@ -9,8 +9,9 @@ import "./QuestButton.css";
 import { findByCodeLazy, findByPropsLazy, findComponentByCodeLazy } from "@webpack";
 import { Tooltip, useEffect, useState } from "@webpack/common";
 
+const Flex = findByPropsLazy("Direction", "Justify");
+
 import { QuestsStore } from "../stores";
-import { Flex } from "@components/Flex";
 
 const QuestIcon = findByCodeLazy("\"M7.5 21.7a8.95");
 const { navigateToQuestHome } = findByPropsLazy("navigateToQuestHome");
@@ -38,21 +39,21 @@ function questsStatus() {
 }
 
 export function QuestsCount() {
-    const [status, setStatus] = useState(questsStatus());
+    const [status, setStatus] = useState({ enrollable: 0, enrolled: 0, claimable: 0, claimed: 0, expired: 0 });
 
     const checkForNewQuests = () => {
         setStatus(questsStatus());
     };
 
     useEffect(() => {
-        QuestsStore.addChangeListener(checkForNewQuests);
-        return () => {
-            QuestsStore.removeChangeListener(checkForNewQuests);
-        };
-    }, []);
+  if (!QuestsStore) return;
+  QuestsStore.addChangeListener(checkForNewQuests);
+  return () => QuestsStore.removeChangeListener(checkForNewQuests);
+}, []);
 
     return (
-        <Flex flexDirection={"row"} justifyContent={"flex-end"} className={"quest-button-badges"}>
+        <Flex direction={Flex.Direction.HORIZONTAL} justify={Flex.Justify.END} className={"quest-button-badges"}>
+
             {status.enrollable > 0 && (
                 <Tooltip text={"Enrollable"}>
                     {({ onMouseEnter, onMouseLeave }) => (
@@ -94,7 +95,7 @@ export function QuestsCount() {
 }
 
 export function QuestButton({ type }: { type: "top-bar" | "settings-bar"; }) {
-    const [state, setState] = useState(questsStatus());
+    const [state, setState] = useState({ enrollable: 0, enrolled: 0, claimable: 0, claimed: 0, expired: 0 });
 
     const checkForNewQuests = () => {
         setState(questsStatus());
