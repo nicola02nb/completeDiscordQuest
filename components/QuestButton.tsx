@@ -10,18 +10,24 @@ import { Flex } from "@components/Flex";
 import { findByCodeLazy, findByPropsLazy, findComponentByCodeLazy } from "@webpack";
 import { Tooltip, useEffect, useState } from "@webpack/common";
 
-import { QuestsStore } from "../stores";
+import { getQuestsStore } from "../stores";
 
 const QuestIcon = findByCodeLazy("\"M7.5 21.7a8.95");
-const { navigateToQuestHome } = findByPropsLazy("navigateToQuestHome");
+const { navigateToQuestHome } = findByPropsLazy("navigateToQuestHome") ?? {};
 const TopBarButton = findComponentByCodeLazy("badgePosition", "icon");
 const SettingsBarButton = findComponentByCodeLazy("keyboardShortcut", "positionKey");
 const CountBadge = findComponentByCodeLazy("renderBadgeCount", "disableColor");
 
 function questsStatus() {
-    const availableQuests = [...QuestsStore.quests.values()];
+    const store = getQuestsStore();
+    const questsMap = store?.quests ?? (typeof store?.getQuests === "function" ? store.getQuests() : null);
+    if (!questsMap || !(questsMap instanceof Map)) {
+        return { enrollable: 0, enrolled: 0, claimable: 0, claimed: 0, expired: 0 };
+    }
+
+    const availableQuests = [...questsMap.values()];
     return availableQuests.reduce((acc, x) => {
-        if (new Date(x.config.expiresAt).getTime() < Date.now()) {
+        if (new Date(x.config?.expiresAt).getTime() < Date.now()) {
             acc.expired++;
         } else if (x.userStatus?.claimedAt) {
             acc.claimed++;
@@ -44,10 +50,13 @@ export function QuestsCount() {
     };
 
     useEffect(() => {
-        QuestsStore.addChangeListener(checkForNewQuests);
-        return () => {
-            QuestsStore.removeChangeListener(checkForNewQuests);
-        };
+        const store = getQuestsStore();
+        if (store?.addChangeListener) {
+            try { store.addChangeListener(checkForNewQuests); } catch {}
+            return () => {
+                try { store.removeChangeListener(checkForNewQuests); } catch {}
+            };
+        }
     }, []);
 
     return (
@@ -116,15 +125,19 @@ export function QuestButton({ type }: { type: "top-bar" | "settings-bar"; }) {
     };
 
     useEffect(() => {
-        QuestsStore.addChangeListener(checkForNewQuests);
-        return () => {
-            QuestsStore.removeChangeListener(checkForNewQuests);
-        };
+        const store = getQuestsStore();
+        if (store?.addChangeListener) {
+            try { store.addChangeListener(checkForNewQuests); } catch {}
+            return () => {
+                try { store.removeChangeListener(checkForNewQuests); } catch {}
+            };
+        }
     }, []);
 
     const className = state.enrollable ? "quest-button-enrollable" : state.enrolled ? "quest-button-enrolled" : state.claimable ? "quest-button-claimable" : "";
     const tooltip = state.enrollable ? `${state.enrollable} Enrollable Quests` : state.enrolled ? `${state.enrolled} Enrolled Quests` : state.claimable ? `${state.claimable} Claimable Quests` : "Quests";
-    if (type === "top-bar") {
+
+    if (type === "top-bar" && TopBarButton) {
         return (
             <TopBarButton
                 className={className}
@@ -141,7 +154,7 @@ export function QuestButton({ type }: { type: "top-bar" | "settings-bar"; }) {
                 hideOnClick={false}
             />
         );
-    } else if (type === "settings-bar") {
+    } else if (type === "settings-bar" && SettingsBarButton) {
         return (
             <SettingsBarButton
                 tooltipText={tooltip}
@@ -150,18 +163,24 @@ export function QuestButton({ type }: { type: "top-bar" | "settings-bar"; }) {
                 disabled={navigateToQuestHome === undefined}
                 icon={undefined}
                 className={"quest-button"}
-            ><TopBarButton
-                    className={className}
-                    iconClassName={undefined}
-                    disabled={navigateToQuestHome === undefined}
-                    showBadge={state.enrollable > 0 || state.enrolled > 0 || state.claimable > 0}
-                    badgePosition={"bottom"}
-                    icon={QuestIcon}
-                    iconSize={20}
-                    onClick={navigateToQuestHome}
-                    onContextMenu={undefined}
-                    hideOnClick={false}
-                /></SettingsBarButton>
+            >
+                {TopBarButton && (
+                    <TopBarButton
+                        className={className}
+                        iconClassName={undefined}
+                        disabled={navigateToQuestHome === undefined}
+                        showBadge={state.enrollable > 0 || state.enrolled > 0 || state.claimable > 0}
+                        badgePosition={"bottom"}
+                        icon={QuestIcon}
+                        iconSize={20}
+                        onClick={navigateToQuestHome}
+                        onContextMenu={undefined}
+                        hideOnClick={false}
+                    />
+                )}
+            </SettingsBarButton>
         );
     }
+
+    return null;
 }

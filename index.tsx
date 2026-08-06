@@ -10,18 +10,24 @@ import { FluxDispatcher, RestAPI } from "@webpack/common";
 
 import { QuestButton, QuestsCount } from "./components/QuestButton";
 import settings from "./settings";
-import { ChannelStore, GuildChannelStore, QuestsStore, RunningGameStore } from "./stores";
+import { 
+    getApplicationStreamingStore, 
+    getChannelStore, 
+    getGuildChannelStore, 
+    getQuestsStore, 
+    getRunningGameStore 
+} from "./stores";
 
-const QuestApplyAction = findByCodeLazy("type:\"QUESTS_ENROLL_BEGIN\"") as (questId: string, action: QuestAction) => Promise<any>;
+const QuestApplyAction = findByCodeLazy("type:\"QUESTS_ENROLL_BEGIN\"") as (questId: string, action: any) => Promise<any>;
 const QuestLocationMap = findByPropsLazy("QUEST_HOME_DESKTOP", "11") as Record<string, any>;
 
-let availableQuests: QuestValue[] = [];
-let acceptableQuests: QuestValue[] = [];
-let completableQuests: QuestValue[] = [];
+let availableQuests: any[] = [];
+let acceptableQuests: any[] = [];
+let completableQuests: any[] = [];
 
-const completingQuest = new Map();
-const fakeGames = new Map();
-const fakeApplications = new Map();
+const completingQuest = new Map<string, boolean>();
+const fakeGames = new Map<string, any>();
+const fakeApplications = new Map<string, any>();
 
 const CONSENT_WARNING = [
     "Important Notice",
@@ -37,7 +43,10 @@ export default definePlugin({
     name: "CompleteDiscordQuest",
     description: "A plugin that completes multiple discord quests in background simultaneously.",
     authors: [{
-        name: "nicola02nb",
+        name: "tah.toh", 
+        id: 756926734607056977n
+    },{
+        name: "nicola02nb", 
         id: 257900031351193600n
     }],
     settings,
@@ -46,7 +55,7 @@ export default definePlugin({
             find: ".PlatformTypes.WEB",
             replacement: {
                 match: /(\((\i)\){)(let{leading)/,
-                replace: "$1$2?.trailing?.props?.children?.unshift($self.renderQuestButtonTopBar());$3"
+                replace: "$1$2?.trailing?.props?.children?.unshift?.($self.renderQuestButtonTopBar());$3"
             }
         },
         {
@@ -56,32 +65,19 @@ export default definePlugin({
                 replace: "$&$self.renderQuestButtonSettingsBar(),"
             }
         },
-        { // PTB Experimental
+        {
+            // Sidebar Navigation Item Patch ("Quests" link indicated in image)
+            find: "connected-accounts",
+            replacement: {
+                match: /(children:\[.*?\(\d+,\i\.jsx\)\(\i,\{to:"\/nitro"\}[^\]]*?)(?=\]\})/,
+                replace: "$1,$self.renderSidebarQuestsButton()"
+            }
+        },
+        { // PTB / Badges Experimental
             find: "\"innerRef\",\"navigate\",\"onClick\"",
             replacement: {
                 match: /(\i).createElement\("a",(\i)\)/,
                 replace: "$1.createElement(\"a\",$self.renderQuestButtonBadges($2))"
-            }
-        },
-        {
-            find: "\"RunningGameStore\"",
-            group: true,
-            replacement: [
-                {
-                    match: /}getRunningGames\(\){return/,
-                    replace: "}getRunningGames(){const games=$self.getRunningGames();return games ? games : "
-                },
-                {
-                    match: /}getGameForPID\((\i)\){/,
-                    replace: "}getGameForPID($1){const pid=$self.getGameForPID($1);if(pid){return pid;}"
-                }
-            ]
-        },
-        {
-            find: "ApplicationStreamingStore",
-            replacement: {
-                match: /}getStreamerActiveStreamMetadata\(\){/,
-                replace: "}getStreamerActiveStreamMetadata(){const metadata=$self.getStreamerActiveStreamMetadata();if(metadata){return metadata;}"
             }
         }
     ],
@@ -91,11 +87,25 @@ export default definePlugin({
             return;
         }
 
-        QuestsStore.addChangeListener(updateQuests);
+        const questsStore = getQuestsStore();
+        if (questsStore && typeof questsStore.addChangeListener === "function") {
+            try {
+                questsStore.addChangeListener(updateQuests);
+            } catch (err) {
+                console.error("[CompleteDiscordQuest] Add listener error:", err);
+            }
+        }
         updateQuests();
     },
     stop: () => {
-        QuestsStore.removeChangeListener(updateQuests);
+        const questsStore = getQuestsStore();
+        if (questsStore && typeof questsStore.removeChangeListener === "function") {
+            try {
+                questsStore.removeChangeListener(updateQuests);
+            } catch (err) {
+                console.error("[CompleteDiscordQuest] Remove listener error:", err);
+            }
+        }
         stopAllFarming();
     },
 
@@ -111,13 +121,16 @@ export default definePlugin({
         }
     },
 
-    renderQuestButtonBadges(questButton) {
+    renderSidebarQuestsButton() {
+        return <QuestButton type="settings-bar" />;
+    },
+
+    renderQuestButtonBadges(questButton: any) {
         if (settings.store.showQuestsButtonBadges && typeof questButton === "string" && questButton === "quests") {
             return (<QuestsCount />);
         }
-        // Experiment
         if (settings.store.showQuestsButtonBadges && questButton?.href?.startsWith("/quest-home")
-            && Array.isArray(questButton?.children) && questButton.children.findIndex(child => child?.type === QuestsCount) === -1) {
+            && Array.isArray(questButton?.children) && questButton.children.findIndex((child: any) => child?.type === QuestsCount) === -1) {
             questButton.children.push(<QuestsCount />);
         }
         return questButton;
@@ -129,7 +142,7 @@ export default definePlugin({
         }
     },
 
-    getGameForPID(pid) {
+    getGameForPID(pid: number) {
         if (fakeGames.size > 0) {
             return Array.from(fakeGames.values()).find(game => game.pid === pid);
         }
@@ -142,24 +155,17 @@ export default definePlugin({
     }
 });
 
-function isQuestEligibleForFarming(quest: QuestValue): boolean {
-    const questConfig = quest.config.taskConfig || quest.config.taskConfigV2;
-    if (!Object.keys(questConfig.tasks).some(taskName => {
+function isQuestEligibleForFarming(quest: any): boolean {
+    const questConfig = quest?.config?.taskConfig || quest?.config?.taskConfigV2;
+    if (!questConfig?.tasks) return false;
+
+    const taskKeys = Object.keys(questConfig.tasks);
+    return taskKeys.some(taskName => {
         return (taskName === "WATCH_VIDEO" && settings.store.farmVideos
             || taskName === "WATCH_VIDEO_ON_MOBILE" && settings.store.farmVideos
             || taskName === "PLAY_ON_DESKTOP" && settings.store.farmPlayOnDesktop
             || taskName === "STREAM_ON_DESKTOP" && settings.store.farmStreamOnDesktop
             || taskName === "PLAY_ACTIVITY" && settings.store.farmPlayActivity);
-    })) return false;
-
-    const rewards = quest.config?.rewardsConfig?.rewards || [];
-    if (!Array.isArray(rewards) || rewards.length === 0) return false;
-    return rewards.some(reward => {
-        return (reward.type === 1 && settings.store.farmRewardCodes
-            || reward.type === 2 && settings.store.farmInGame
-            || reward.type === 3 && settings.store.farmCollectibles
-            || reward.type === 4 && settings.store.farmVirtualCurrency
-            || reward.type === 5 && settings.store.farmFractionalPremium);
     });
 }
 
@@ -185,41 +191,62 @@ function updateQuests() {
         return;
     }
 
-    availableQuests = [...QuestsStore.quests.values()];
-    acceptableQuests = availableQuests.filter(x => x.userStatus?.enrolledAt == null && new Date(x.config.expiresAt).getTime() > Date.now()) || [];
-    completableQuests = availableQuests.filter(x => x.userStatus?.enrolledAt && !x.userStatus?.completedAt && new Date(x.config.expiresAt).getTime() > Date.now()) || [];
-    for (const quest of acceptableQuests) {
-        if (isQuestEligibleForFarming(quest)) {
-            acceptQuest(quest);
-        }
+    const questsStore = getQuestsStore();
+    if (!questsStore) return;
+
+    let questMap: Map<string, any> | null = null;
+    if (questsStore.quests instanceof Map) {
+        questMap = questsStore.quests;
+    } else if (typeof questsStore.getQuests === "function") {
+        questMap = questsStore.getQuests();
     }
-    for (const quest of completableQuests) {
-        if (completingQuest.has(quest.id)) {
-            if (completingQuest.get(quest.id) === false) {
-                completingQuest.delete(quest.id);
+
+    if (!questMap || !(questMap instanceof Map)) return;
+
+    try {
+        availableQuests = [...questMap.values()];
+        acceptableQuests = availableQuests.filter(x => x?.userStatus?.enrolledAt == null && new Date(x?.config?.expiresAt).getTime() > Date.now());
+        completableQuests = availableQuests.filter(x => x?.userStatus?.enrolledAt && !x?.userStatus?.completedAt && new Date(x?.config?.expiresAt).getTime() > Date.now());
+
+        for (const quest of acceptableQuests) {
+            if (isQuestEligibleForFarming(quest)) {
+                acceptQuest(quest);
             }
-        } else {
-            completeQuest(quest);
         }
+
+        for (const quest of completableQuests) {
+            if (completingQuest.has(quest.id)) {
+                if (completingQuest.get(quest.id) === false) {
+                    completingQuest.delete(quest.id);
+                }
+            } else {
+                completeQuest(quest);
+            }
+        }
+    } catch (err) {
+        console.error("[CompleteDiscordQuest] Error updating quests:", err);
     }
-    /* console.log("Available quests updated:", availableQuests);
-    console.log("Acceptable quests updated:", acceptableQuests);
-    console.log("Completable quests updated:", completableQuests); */
 }
 
-function acceptQuest(quest: QuestValue) {
-    if (!settings.store.acceptQuestsAutomatically) return;
-    console.log("Accepting quest:", quest.config.messages.questName);
-    const action: QuestAction = {
-        questContent: QuestLocationMap.QUEST_HOME_DESKTOP,
+function acceptQuest(quest: any) {
+    console.log("[CompleteDiscordQuest] Enrolling quest:", quest.config?.messages?.questName);
+    const action = {
+        questContent: QuestLocationMap?.QUEST_HOME_DESKTOP ?? 1,
         questContentCTA: "ACCEPT_QUEST",
         sourceQuestContent: 0,
     };
-    QuestApplyAction(quest.id, action).then(() => {
-        console.log("Accepted quest:", quest.config.messages.questName);
-    }).catch(err => {
-        console.error("Failed to accept quest:", quest.config.messages.questName, err);
-    });
+    if (typeof QuestApplyAction === "function") {
+        try {
+            QuestApplyAction(quest.id, action).then(() => {
+                console.log("[CompleteDiscordQuest] Accepted quest:", quest.config?.messages?.questName);
+                updateQuests();
+            }).catch(err => {
+                console.error("[CompleteDiscordQuest] Failed to accept quest:", quest.config?.messages?.questName, err);
+            });
+        } catch (err) {
+            console.error("[CompleteDiscordQuest] Exception during QuestApplyAction:", err);
+        }
+    }
 }
 
 function stopCompletingAll() {
@@ -237,7 +264,8 @@ function stopAllFarming() {
     if (fakeGames.size > 0) {
         const removedGames = Array.from(fakeGames.values());
         fakeGames.clear();
-        const games = RunningGameStore.getRunningGames();
+        const runningGameStore = getRunningGameStore();
+        const games = runningGameStore?.getRunningGames?.() ?? [];
         FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: removedGames, added: games, games });
     }
 
@@ -246,193 +274,141 @@ function stopAllFarming() {
     }
 }
 
-function completeQuest(quest: QuestValue) {
+function completeQuest(quest: any) {
     if (!settings.store.hasAcceptedToUsePlugin) {
         stopAllFarming();
         console.warn("Consent not accepted. Cannot complete quests.");
         return;
     }
 
-    const isApp = typeof DiscordNative !== "undefined";
-    if (!quest) {
-        console.log("You don't have any uncompleted quests!");
-    } else {
-        const pid = Math.floor(Math.random() * 30000) + 1000;
+    if (!quest) return;
 
-        const applicationId = quest.config.application.id;
-        const applicationName = quest.config.application.name;
-        const { questName } = quest.config.messages;
-        const taskConfig = quest.config.taskConfig ?? quest.config.taskConfigV2;
-        const taskName = ["WATCH_VIDEO", "PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP", "PLAY_ACTIVITY", "WATCH_VIDEO_ON_MOBILE"].find(x => taskConfig.tasks[x] != null);
-        if (!taskName) {
-            console.log("Unknown task type for quest:", questName);
-            return;
-        }
-        const secondsNeeded = taskConfig.tasks[taskName].target;
-        let secondsDone = quest.userStatus?.progress?.[taskName]?.value ?? 0;
+    const pid = Math.floor(Math.random() * 30000) + 1000;
+    const applicationId = quest.config?.application?.id;
+    const applicationName = quest.config?.application?.name;
+    const questName = quest.config?.messages?.questName ?? "Unknown Quest";
+    const taskConfig = quest.config?.taskConfig ?? quest.config?.taskConfigV2;
 
-        if (!isApp && taskName !== "WATCH_VIDEO" && taskName !== "WATCH_VIDEO_ON_MOBILE") {
-            console.log("This no longer works in browser for non-video quests (" + taskName + "). Use the discord desktop app to complete the", questName, "quest!");
-            return;
-        }
+    if (!taskConfig?.tasks) return;
 
-        completingQuest.set(quest.id, true);
+    const taskName = ["WATCH_VIDEO", "PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP", "PLAY_ACTIVITY", "WATCH_VIDEO_ON_MOBILE"].find(x => taskConfig.tasks[x] != null);
+    if (!taskName) return;
 
-        console.log(`Completing quest ${questName} (${quest.id}) - ${taskName} for ${secondsNeeded} seconds.`);
+    const secondsNeeded = taskConfig.tasks[taskName].target;
+    let secondsDone = quest.userStatus?.progress?.[taskName]?.value ?? 0;
 
-        switch (taskName) {
-            case "WATCH_VIDEO":
-            case "WATCH_VIDEO_ON_MOBILE":
-                const maxFuture = 10, speed = 7, interval = 1;
-                const enrolledAt = new Date(quest.userStatus.enrolledAt).getTime();
-                let completed = false;
-                const watchVideo = async () => {
-                    while (true) {
-                        const maxAllowed = Math.floor((Date.now() - enrolledAt) / 1000) + maxFuture;
-                        const diff = maxAllowed - secondsDone;
-                        const timestamp = secondsDone + speed;
+    completingQuest.set(quest.id, true);
+    console.log(`[CompleteDiscordQuest] Completing ${questName} (${taskName}) - Target: ${secondsNeeded}s`);
 
-                        if (!completingQuest.get(quest.id)) {
-                            console.log("Stopping completing quest:", questName);
-                            completingQuest.set(quest.id, false);
-                            break;
-                        }
+    switch (taskName) {
+        case "WATCH_VIDEO":
+        case "WATCH_VIDEO_ON_MOBILE":
+            const watchVideo = async () => {
+                const stepSeconds = 7;
+                let currentProgress = secondsDone;
 
-                        if (diff >= speed) {
-                            const res = await RestAPI.post({ url: `/quests/${quest.id}/video-progress`, body: { timestamp: Math.min(secondsNeeded, timestamp + Math.random()) } });
-                            completed = res.body.completed_at != null;
-                            secondsDone = Math.min(secondsNeeded, timestamp);
-                        }
+                while (completingQuest.get(quest.id) && currentProgress < secondsNeeded) {
+                    currentProgress = Math.min(secondsNeeded, currentProgress + stepSeconds);
 
-                        if (timestamp >= secondsNeeded) {
-                            completingQuest.set(quest.id, false);
-                            break;
-                        }
-                        await new Promise(resolve => setTimeout(resolve, interval * 1000));
-                    }
-                    if (!completed) {
-                        await RestAPI.post({ url: `/quests/${quest.id}/video-progress`, body: { timestamp: secondsNeeded } });
-                    }
-                    console.log("Quest completed!");
-                };
-                watchVideo();
-                console.log(`Spoofing video for ${questName}.`);
-                break;
-
-            case "PLAY_ON_DESKTOP":
-                RestAPI.get({ url: `/applications/public?application_ids=${applicationId}` }).then(res => {
-                    const appData = res.body[0];
-                    const exeName = appData.executables?.find(x => x.os === "win32")?.name?.replace(">","") ?? appData.name.replace(/[\/\\:*?"<>|]/g, "");
-
-                    const fakeGame = {
-                        cmdLine: `C:\\Program Files\\${appData.name}\\${exeName}`,
-                        exeName,
-                        exePath: `c:/program files/${appData.name.toLowerCase()}/${exeName}`,
-                        hidden: false,
-                        isLauncher: false,
-                        id: applicationId,
-                        name: appData.name,
-                        pid: pid,
-                        pidPath: [pid],
-                        processName: appData.name,
-                        start: Date.now(),
-                    };
-                    const realGames = fakeGames.size === 0 ? RunningGameStore.getRunningGames() : [];
-                    fakeGames.set(quest.id, fakeGame);
-                    const fakeGames2 = Array.from(fakeGames.values());
-                    FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: realGames, added: [fakeGame], games: fakeGames2 });
-
-                    const playOnDesktop = event => {
-                        if (event.questId !== quest.id) return;
-                        const progress = quest.config.configVersion === 1 ? event.userStatus.streamProgressSeconds : Math.floor(event.userStatus.progress.PLAY_ON_DESKTOP.value);
-                        console.log(`Quest progress ${questName}: ${progress}/${secondsNeeded}`);
-
-                        if (!completingQuest.get(quest.id) || progress >= secondsNeeded) {
-                            console.log("Stopping completing quest:", questName);
-
-                            fakeGames.delete(quest.id);
-                            const games = RunningGameStore.getRunningGames();
-                            const added = fakeGames.size === 0 ? games : [];
-                            FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: [fakeGame], added: added, games: games });
-                            FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", playOnDesktop);
-
-                            if (progress >= secondsNeeded) {
-                                console.log("Quest completed!");
-                                completingQuest.set(quest.id, false);
+                    try {
+                        const res = await RestAPI.post({
+                            url: `/quests/${quest.id}/video-progress`,
+                            body: { 
+                                timestamp: currentProgress,
+                                current_progress_seconds: currentProgress
                             }
+                        });
+
+                        console.log(`[Video Quest] ${questName} progress: ${currentProgress}/${secondsNeeded}s`);
+
+                        if (res.body?.completed_at != null || currentProgress >= secondsNeeded) {
+                            console.log(`Quest completed!`);
+                            completingQuest.set(quest.id, false);
+                            break;
                         }
-                    };
-                    FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", playOnDesktop);
+                    } catch (err) {
+                        console.error(`[Video Quest] Failed progress report for ${questName}:`, err);
+                        completingQuest.set(quest.id, false);
+                        break;
+                    }
 
-                    console.log(`Spoofed your game to ${applicationName}. Wait for ${Math.ceil((secondsNeeded - secondsDone) / 60)} more minutes.`);
-                });
-                break;
+                    await new Promise(resolve => setTimeout(resolve, 5000));
+                }
+            };
 
-            case "STREAM_ON_DESKTOP":
-                const fakeApp = {
+            watchVideo();
+            break;
+
+        case "PLAY_ON_DESKTOP":
+        case "PLAY_ACTIVITY":
+            const playDesktopQuest = async () => {
+                const exeName = applicationName?.replace(/[\/\\:*?"<>|]/g, "") ?? "game";
+                const fakeGame = {
+                    cmdLine: `/usr/bin/${exeName}`,
+                    exeName,
+                    exePath: `/usr/bin/${exeName.toLowerCase()}`,
+                    hidden: false,
+                    isLauncher: false,
                     id: applicationId,
-                    name: `FakeApp ${applicationName} (CompleteDiscordQuest)`,
+                    name: applicationName,
                     pid: pid,
-                    sourceName: null,
+                    pidPath: [pid],
+                    processName: applicationName,
+                    start: Date.now(),
                 };
-                fakeApplications.set(quest.id, fakeApp);
 
-                const streamOnDesktop = event => {
-                    if (event.questId !== quest.id) return;
-                    const progress = quest.config.configVersion === 1 ? event.userStatus.streamProgressSeconds : Math.floor(event.userStatus.progress.STREAM_ON_DESKTOP.value);
-                    console.log(`Quest progress ${questName}: ${progress}/${secondsNeeded}`);
+                fakeGames.set(quest.id, fakeGame);
+                FluxDispatcher.dispatch({ 
+                    type: "RUNNING_GAMES_CHANGE", 
+                    removed: [], 
+                    added: [fakeGame], 
+                    games: Array.from(fakeGames.values()) 
+                });
 
-                    if (!completingQuest.get(quest.id) || progress >= secondsNeeded) {
-                        console.log("Stopping completing quest:", questName);
+                while (completingQuest.get(quest.id)) {
+                    try {
+                        const res = await RestAPI.post({
+                            url: `/quests/${quest.id}/heartbeat`,
+                            body: { terminal: false }
+                        });
 
-                        fakeApplications.delete(quest.id);
-                        FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", streamOnDesktop);
+                        const progress = res.body?.progress?.PLAY_ON_DESKTOP?.value 
+                            ?? res.body?.progress?.PLAY_ACTIVITY?.value 
+                            ?? 0;
 
-                        if (progress >= secondsNeeded) {
-                            console.log("Quest completed!");
+                        console.log(`[Play Quest] ${questName} progress: ${progress}/${secondsNeeded}s`);
+
+                        if (res.body?.completed_at != null || progress >= secondsNeeded) {
+                            await RestAPI.post({
+                                url: `/quests/${quest.id}/heartbeat`,
+                                body: { terminal: true }
+                            });
+                            console.log(`[Play Quest] Quest completed: ${questName}`);
                             completingQuest.set(quest.id, false);
-                        }
-                    }
-                };
-                FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", streamOnDesktop);
-
-                console.log(`Spoofed your stream to ${applicationName}. Stream any window in vc for ${Math.ceil((secondsNeeded - secondsDone) / 60)} more minutes.`);
-                console.log("Remember that you need at least 1 other person to be in the vc!");
-                break;
-
-            case "PLAY_ACTIVITY":
-                const channelId = ChannelStore.getSortedPrivateChannels()[0]?.id ?? Object.values(GuildChannelStore.getAllGuilds()).find(x => x != null && x.VOCAL.length > 0).VOCAL[0].channel.id;
-                const streamKey = `call:${channelId}:1`;
-
-                const playActivity = async () => {
-                    console.log("Completing quest", questName, "-", quest.config.messages.questName);
-
-                    while (true) {
-                        const res = await RestAPI.post({ url: `/quests/${quest.id}/heartbeat`, body: { stream_key: streamKey, terminal: false } });
-                        const progress = res.body.progress.PLAY_ACTIVITY.value;
-                        console.log(`Quest progress ${questName}: ${progress}/${secondsNeeded}`);
-
-                        await new Promise(resolve => setTimeout(resolve, 20 * 1000));
-
-                        if (!completingQuest.get(quest.id) || progress >= secondsNeeded) {
-                            console.log("Stopping completing quest:", questName);
-
-                            if (progress >= secondsNeeded) {
-                                await RestAPI.post({ url: `/quests/${quest.id}/heartbeat`, body: { stream_key: streamKey, terminal: true } });
-                                console.log("Quest completed!");
-                                completingQuest.set(quest.id, false);
-                            }
+                            fakeGames.delete(quest.id);
+                            FluxDispatcher.dispatch({ 
+                                type: "RUNNING_GAMES_CHANGE", 
+                                removed: [fakeGame], 
+                                added: [], 
+                                games: Array.from(fakeGames.values()) 
+                            });
                             break;
                         }
+                    } catch (err) {
+                        console.error(`[Play Quest] Heartbeat failed for ${questName}:`, err);
+                        completingQuest.set(quest.id, false);
+                        break;
                     }
-                };
-                playActivity();
-                break;
 
-            default:
-                console.error("Unknown task type:", taskName);
-                completingQuest.set(quest.id, false);
-                break;
-        }
+                    await new Promise(resolve => setTimeout(resolve, 20000));
+                }
+            };
+
+            playDesktopQuest();
+            break;
+
+        default:
+            completingQuest.set(quest.id, false);
+            break;
     }
 }
