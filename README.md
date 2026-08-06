@@ -16,6 +16,8 @@ You need these installed first:
 
 ### First Time Setup
 
+**Option A: Automated Install (Recommended)**
+
 1. **Clone Vencord** (if you haven't already):
    ```powershell
    cd $HOME\Documents
@@ -24,66 +26,103 @@ You need these installed first:
    pnpm install --frozen-lockfile
    ```
 
-2. **Add the Plugin**:
-   - [Download the latest release ZIP](https://github.com/h1z1z1h16584/completeDiscordQuest/archive/refs/heads/main.zip)
-   - Extract the files into: `Vencord\src\userplugins\completeDiscordQuest`
+2. **Download completeDiscordQuest**:
+   - [Download the latest release](https://github.com/h1z1z1h16584/completeDiscordQuest/archive/refs/heads/main.zip)
+   - Extract the ZIP to a temporary location
 
 3. **Run the Installer**:
-   - Navigate to the plugin folder and double-click **`Run Update.bat`**.
-   - **Select Option 1 (Local Update)** for the initial setup.
+   - Double-click **`Run Update.bat`**
    - The script will:
-     - **Kill Discord** to prevent file lock errors.
-     - Sync the files and run `pnpm build`.
-     - **Auto-restart Discord** once finished.
+     - Find your Vencord installation
+     - Copy the plugin to `src/userplugins/completeDiscordQuest/`
+     - Build Vencord with the plugin
+     - Inject into Discord
 
 4. **Enable the Plugin**:
-   - Open Discord.
-   - Go to **Settings → Vencord → Plugins**.
-   - Search for **completeDiscordQuest** and enable it.
+   - Restart Discord completely (close from system tray)
+   - Go to **Settings → Vencord → Plugins**
+   - Search for **completeDiscordQuest** and enable it
+
+**Option B: Manual Install**
+
+```powershell
+# Clone Vencord (skip if you already have it)
+cd $HOME\Documents
+git clone https://github.com/Vendicated/Vencord.git
+cd Vencord
+pnpm install --frozen-lockfile
+
+# Add completeDiscordQuest plugin
+cd src\userplugins
+git clone https://github.com/h1z1z1h16584/completeDiscordQuest.git completeDiscordQuest
+
+# Build and inject
+cd ..\..
+pnpm build
+pnpm inject
+```
 
 ---
 
 ## Updating
 
-This plugin features a smart "Dual-Mode" updater. To update, simply run **`Run Update.bat`** and choose your method:
+Navigate to your plugin folder and double-click **`Run Update.bat`**:
+```
+Documents\Vencord\src\userplugins\completeDiscordQuest\Run Update.bat
+```
 
-### Option 1: Local Update
-Use this if you have manually modified the plugin files or downloaded a new ZIP. It syncs your current folder to the Vencord source.
+Or manually:
+```powershell
+cd $HOME\Documents\Vencord\src\userplugins\completeDiscordQuest
+git pull
+cd ..\..\..\
+pnpm build
+pnpm inject
+```
 
-### Option 2: Online Update (Recommended)
-Use this to automatically fetch the latest official bug fixes and features directly from GitHub. It performs a `git fetch` and `rebase` before rebuilding.
+Restart Discord after updating.
 
 ---
 
 ## Supported Quest Types
 
-| Quest Type | Desktop |
-| :--- | :---: |
-| Video Quests | ✅ |
-| Desktop Gameplay | ✅ |
-| Stream Quests | ✅ |
-| Activity Quests | ✅ |
+| Quest Type | Browser | Desktop |
+|------------|---------|---------|
+| Video Quests | ✅ | ✅ |
+| Desktop Gameplay | ❌ | ✅ |
+| Stream Quests | ❌ | ✅* |
+| Activity Quests | ✅ | ✅ |
 
+*Stream quests require at least one other person in a voice channel.
 
 ---
 
 ## Troubleshooting
 
-**Discord doesn't close or restart?**
-- The script targets the standard `Discord.exe`. If you use **Discord Canary** or **PTB**, edit the `.ps1` files and change the `Stop-Process` name to match your version.
+**Plugin doesn't appear?**
+- Make sure you built from source: `pnpm build`
+- Restart Discord completely (close from system tray too)
+- The official Vencord installer doesn't support userplugins
 
-**"pnpm: command not found"**
-- Ensure you ran `npm install -g pnpm`. You may need to restart your terminal or computer for the changes to take effect.
+**Build errors?**
+- Ensure Node.js v18+ is installed: `node --version`
+- Ensure pnpm is installed: `pnpm --version`
+- Try `pnpm install --frozen-lockfile` before building
+
+**"pnpm: command not found"?**
+- Install pnpm: `npm install -g pnpm`
+- Restart your terminal after installing
 
 ---
 
 ## Uninstalling
 
-1. Delete the folder: `Vencord\src\userplugins\completeDiscordQuest`
-2. Re-build Vencord to clean the injection:
-   ```powershell
-   cd $HOME\Documents\Vencord
-   pnpm build
-   pnpm inject
-   ```
-3. Restart Discord.
+```powershell
+cd $HOME\Documents\Vencord
+rm -r src\userplugins\completeDiscordQuest
+pnpm build
+pnpm inject
+```
+
+Restart Discord after uninstalling.
+

@@ -4,12 +4,82 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-import { findByPropsLazy, findStoreLazy } from "@webpack";
+import { findByProps, findByPropsLazy, findStore, findStoreLazy } from "@webpack";
 
-import * as t from "./types/stores";
+// Export lazy proxies for JSX component imports (QuestButton.tsx)
+export const QuestsStore: any = findStoreLazy("QuestsStore");
+export const RunningGameStore: any = findStoreLazy("RunningGameStore");
+export const ApplicationStreamingStore: any = findStoreLazy("ApplicationStreamingStore");
+export const ChannelStore: any = findStoreLazy("ChannelStore");
+export const GuildChannelStore: any = findStoreLazy("GuildChannelStore");
 
-export const ApplicationStreamingStore: t.ApplicationStreamingStore = findStoreLazy("ApplicationStreamingStore");
-export const RunningGameStore: t.RunningGameStore = findStoreLazy("RunningGameStore");
-export const QuestsStore: t.QuestsStore = findByPropsLazy("getQuest");
-export const ChannelStore: t.ChannelStore = findStoreLazy("ChannelStore");
-export const GuildChannelStore: t.GuildChannelStore = findStoreLazy("GuildChannelStore");
+// Safe runtime getter functions for background execution
+export function getQuestsStore(): any {
+    try {
+        const store = findStore("QuestsStore");
+        if (store) return store;
+    } catch {}
+
+    try {
+        const propsStore = findByProps("getQuest", "quests") ?? findByProps("getQuest") ?? findByProps("quests");
+        if (propsStore) return propsStore;
+    } catch {}
+
+    return null;
+}
+
+export function getRunningGameStore(): any {
+    try {
+        const store = findStore("RunningGameStore");
+        if (store) return store;
+    } catch {}
+
+    try {
+        const propsStore = findByProps("getRunningGames") ?? findByProps("getRunningGame");
+        if (propsStore) return propsStore;
+    } catch {}
+
+    return null;
+}
+
+export function getApplicationStreamingStore(): any {
+    try {
+        const store = findStore("ApplicationStreamingStore");
+        if (store) return store;
+    } catch {}
+
+    try {
+        const propsStore = findByProps("getStreamerActiveStreamMetadata");
+        if (propsStore) return propsStore;
+    } catch {}
+
+    return null;
+}
+
+export function getChannelStore(): any {
+    try {
+        const store = findStore("ChannelStore");
+        if (store) return store;
+    } catch {}
+
+    try {
+        const propsStore = findByProps("getSortedPrivateChannels");
+        if (propsStore) return propsStore;
+    } catch {}
+
+    return null;
+}
+
+export function getGuildChannelStore(): any {
+    try {
+        const store = findStore("GuildChannelStore");
+        if (store) return store;
+    } catch {}
+
+    try {
+        const propsStore = findByProps("getAllGuilds");
+        if (propsStore) return propsStore;
+    } catch {}
+
+    return null;
+}
