@@ -302,22 +302,20 @@ function completeQuest(quest: QuestValue) {
         switch (taskName) {
             case "WATCH_VIDEO":
             case "WATCH_VIDEO_ON_MOBILE":
-                const enrolledAt = new Date(quest.userStatus.enrolledAt).getTime();
-                const maxFuture = 10, speed = 7;
+                const speed = 7;
                 let completed = false;
                 const watchVideo = async () => {
                     while (true) {
+                        const remaining = Math.min(speed, secondsNeeded - secondsDone);
+                        const timestamp = secondsDone + speed;
+
                         if (!completingQuest.get(quest.id)) {
                             console.log("Stopping completing quest:", questName);
                             completingQuest.set(quest.id, false);
                             break;
                         }
 
-                        const maxAllowed = Math.floor((Date.now() - enrolledAt) / 1000) + maxFuture;
-                        const remaining = secondsDone + speed - maxAllowed;
-                        const timestamp = secondsDone + speed;
-
-                        await new Promise(resolve => setTimeout(resolve, Math.max(0, remaining) * 1000));
+                        await new Promise(resolve => setTimeout(resolve, remaining * 1000));
                         const res = await postWithRetry(`/quests/${quest.id}/video-progress`, { timestamp: Math.min(secondsNeeded, timestamp + Math.random()) });
                         if (res) {
                             completed = res.body.completed_at != null;
@@ -362,14 +360,18 @@ function completeQuest(quest: QuestValue) {
                     const fakeGames2 = Array.from(fakeGames.values());
                     FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: realGames, added: [fakeGame], games: fakeGames2 });
 
+                    let checkInterval: any;
+                    let lastUpdate = Date.now();
                     const playOnDesktop = event => {
                         if (event.questId !== quest.id) return;
+                        lastUpdate = Date.now();
                         const progress = quest.config.configVersion === 1 ? event.userStatus.streamProgressSeconds : Math.floor(event.userStatus.progress.PLAY_ON_DESKTOP.value);
                         console.log(`Quest progress ${questName}: ${progress}/${secondsNeeded}`);
 
                         if (!completingQuest.get(quest.id) || progress >= secondsNeeded) {
                             console.log("Stopping completing quest:", questName);
 
+                            clearInterval(checkInterval);
                             fakeGames.delete(quest.id);
                             const games = RunningGameStore.getRunningGames();
                             const added = fakeGames.size === 0 ? games : [];
@@ -384,6 +386,23 @@ function completeQuest(quest: QuestValue) {
                     };
                     FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", playOnDesktop);
 
+                    checkInterval = setInterval(() => {
+                        if (!completingQuest.get(quest.id)) {
+                            clearInterval(checkInterval);
+                            return;
+                        }
+                        if (Date.now() - lastUpdate > 120000) {
+                            console.log(`No PLAY_ON_DESKTOP progress for ${questName}. Ignoring this quest for now...`);
+                            clearInterval(checkInterval);
+                            fakeGames.delete(quest.id);
+                            const games = RunningGameStore.getRunningGames();
+                            const added = fakeGames.size === 0 ? games : [];
+                            FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: [fakeGame], added: added, games: games });
+                            FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", playOnDesktop);
+                            completingQuest.set(quest.id, false);
+                        }
+                    }, 60000);
+
                     console.log(`Spoofed your game to ${appData.name}. Wait for ${Math.ceil((secondsNeeded - secondsDone) / 60)} more minutes.`);
                 });
                 break;
@@ -397,14 +416,18 @@ function completeQuest(quest: QuestValue) {
                 };
                 fakeApplications.set(quest.id, fakeApp);
 
+                let streamCheckInterval: any;
+                let lastStreamUpdate = Date.now();
                 const streamOnDesktop = event => {
                     if (event.questId !== quest.id) return;
+                    lastStreamUpdate = Date.now();
                     const progress = quest.config.configVersion === 1 ? event.userStatus.streamProgressSeconds : Math.floor(event.userStatus.progress.STREAM_ON_DESKTOP.value);
                     console.log(`Quest progress ${questName}: ${progress}/${secondsNeeded}`);
 
                     if (!completingQuest.get(quest.id) || progress >= secondsNeeded) {
                         console.log("Stopping completing quest:", questName);
 
+                        clearInterval(streamCheckInterval);
                         fakeApplications.delete(quest.id);
                         FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", streamOnDesktop);
 
@@ -415,6 +438,20 @@ function completeQuest(quest: QuestValue) {
                     }
                 };
                 FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", streamOnDesktop);
+
+                streamCheckInterval = setInterval(() => {
+                    if (!completingQuest.get(quest.id)) {
+                        clearInterval(streamCheckInterval);
+                        return;
+                    }
+                    if (Date.now() - lastStreamUpdate > 120000) {
+                        console.log(`No STREAM_ON_DESKTOP progress for ${questName}. Ignoring this quest for now...`);
+                        clearInterval(streamCheckInterval);
+                        fakeApplications.delete(quest.id);
+                        FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", streamOnDesktop);
+                        completingQuest.set(quest.id, false);
+                    }
+                }, 60000);
 
                 console.log(`Spoofed your stream to the target game. Stream any window in vc for ${Math.ceil((secondsNeeded - secondsDone) / 60)} more minutes.`);
                 console.log("Remember that you need at least 1 other person to be in the vc!");
