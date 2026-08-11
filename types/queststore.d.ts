@@ -13,7 +13,7 @@ interface QuestValue {
     id: string;
     preview: boolean;
     config: Config;
-    userStatus: UserStatus;
+    userStatus: UserStatus | null;
     targetedContent: any[];
 }
 
@@ -31,7 +31,7 @@ interface UserStatus {
 }
 
 interface Progress {
-    PLAY_ON_DESKTOP: PLAYONDESKTOP2;
+    [taskName: string]: PLAYONDESKTOP2 | undefined;
 }
 
 interface PLAYONDESKTOP2 {
@@ -53,12 +53,12 @@ interface Config {
     startsAt: string;
     expiresAt: string;
     features: number[];
-    application: Application;
+    application?: Application | null;
     assets: Assets;
     colors: Colors;
     messages: Messages;
-    taskConfig: TaskConfig;
-    taskConfigV2: TaskConfigV2;
+    taskConfig?: TaskConfig | null;
+    taskConfigV2?: TaskConfigV2 | null;
     rewardsConfig: RewardsConfig;
     sharePolicy: string;
 }
@@ -98,12 +98,13 @@ interface TaskConfigV2 {
 }
 
 interface Tasks {
-    PLAY_ON_DESKTOP: PLAYONDESKTOP;
+    [taskName: string]: PLAYONDESKTOP | undefined;
 }
 
 interface PLAYONDESKTOP {
     type: string;
     target: number;
+    applications?: Application[];
 }
 
 interface Messages {

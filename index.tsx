@@ -4,16 +4,21 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+import { Devs } from "@utils/constants";
 import definePlugin from "@utils/types";
+import { PluginNative } from "@utils/types";
 import { findByCodeLazy, findByPropsLazy } from "@webpack";
 import { FluxDispatcher, RestAPI } from "@webpack/common";
 
 import { QuestButton, QuestsCount } from "./components/QuestButton";
 import settings from "./settings";
-import { ChannelStore, GuildChannelStore, QuestsStore, RunningGameStore } from "./stores";
+import { ChannelStore, GuildChannelStore, QuestsStore, RunningGameStore, UserStore } from "./stores";
+
+const Native = VencordNative.pluginHelpers.CompleteDiscordQuest as PluginNative<typeof import("./native")>;
 
 const QuestApplyAction = findByCodeLazy("type:\"QUESTS_ENROLL_BEGIN\"") as (questId: string, action: QuestAction) => Promise<any>;
 const QuestLocationMap = findByPropsLazy("QUEST_HOME_DESKTOP", "11") as Record<string, any>;
+const supportedTasks = ["WATCH_VIDEO", "PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP", "PLAY_ACTIVITY", "WATCH_VIDEO_ON_MOBILE", "ACHIEVEMENT_IN_ACTIVITY"] as const;
 
 let availableQuests: QuestValue[] = [];
 let acceptableQuests: QuestValue[] = [];
@@ -23,23 +28,10 @@ const completingQuest = new Map();
 const fakeGames = new Map();
 const fakeApplications = new Map();
 
-const CONSENT_WARNING = [
-    "Important Notice",
-    "",
-    "As of April 7th 2026, Discord has expressed their intent to crack down on automating quest completion.",
-    "",
-    "Use this plugin at your own risk, as you may get flagged by doing so.",
-    "",
-    "Press OK to keep using this plugin, or Cancel to keep automation disabled."
-].join("\n");
-
 export default definePlugin({
     name: "CompleteDiscordQuest",
     description: "A plugin that completes multiple discord quests in background simultaneously.",
-    authors: [{
-        name: "nicola02nb",
-        id: 257900031351193600n
-    }],
+    authors: [Devs.nicola02nb, Devs.syntt, Devs.djdoolky76],
     settings,
     patches: [
         {
@@ -86,17 +78,12 @@ export default definePlugin({
         }
     ],
     start: () => {
-        if (!ensureHasAcceptedToUsePlugin()) {
-            stopAllFarming();
-            return;
-        }
-
         QuestsStore.addChangeListener(updateQuests);
         updateQuests();
     },
     stop: () => {
         QuestsStore.removeChangeListener(updateQuests);
-        stopAllFarming();
+        stopCompletingAll();
     },
 
     renderQuestButtonTopBar() {
@@ -144,12 +131,15 @@ export default definePlugin({
 
 function isQuestEligibleForFarming(quest: QuestValue): boolean {
     const questConfig = quest.config.taskConfig || quest.config.taskConfigV2;
+    if (!questConfig?.tasks) return false;
+
     if (!Object.keys(questConfig.tasks).some(taskName => {
         return (taskName === "WATCH_VIDEO" && settings.store.farmVideos
             || taskName === "WATCH_VIDEO_ON_MOBILE" && settings.store.farmVideos
             || taskName === "PLAY_ON_DESKTOP" && settings.store.farmPlayOnDesktop
             || taskName === "STREAM_ON_DESKTOP" && settings.store.farmStreamOnDesktop
-            || taskName === "PLAY_ACTIVITY" && settings.store.farmPlayActivity);
+            || taskName === "PLAY_ACTIVITY" && settings.store.farmPlayActivity
+            || taskName === "ACHIEVEMENT_IN_ACTIVITY" && settings.store.farmAchievement);
     })) return false;
 
     const rewards = quest.config?.rewardsConfig?.rewards || [];
@@ -163,28 +153,7 @@ function isQuestEligibleForFarming(quest: QuestValue): boolean {
     });
 }
 
-function ensureHasAcceptedToUsePlugin(): boolean {
-    if (settings.store.hasAcceptedToUsePlugin === true) {
-        return true;
-    }
-
-    const accepted = window.confirm(CONSENT_WARNING);
-    settings.store.hasAcceptedToUsePlugin = accepted;
-
-    if (!accepted) {
-        console.warn("Consent not accepted. Quest completion is disabled.");
-    }
-
-    return accepted;
-}
-
 function updateQuests() {
-    if (!settings.store.hasAcceptedToUsePlugin) {
-        stopAllFarming();
-        console.warn("Consent not accepted. Skipping quest update/completion.");
-        return;
-    }
-
     availableQuests = [...QuestsStore.quests.values()];
     acceptableQuests = availableQuests.filter(x => x.userStatus?.enrolledAt == null && new Date(x.config.expiresAt).getTime() > Date.now()) || [];
     completableQuests = availableQuests.filter(x => x.userStatus?.enrolledAt && !x.userStatus?.completedAt && new Date(x.config.expiresAt).getTime() > Date.now()) || [];
@@ -209,7 +178,6 @@ function updateQuests() {
 
 function acceptQuest(quest: QuestValue) {
     if (!settings.store.acceptQuestsAutomatically) return;
-    console.log("Accepting quest:", quest.config.messages.questName);
     const action: QuestAction = {
         questContent: QuestLocationMap.QUEST_HOME_DESKTOP,
         questContentCTA: "ACCEPT_QUEST",
@@ -231,45 +199,37 @@ function stopCompletingAll() {
     console.log("Stopped completing all quests.");
 }
 
-function stopAllFarming() {
-    stopCompletingAll();
-
-    if (fakeGames.size > 0) {
-        const removedGames = Array.from(fakeGames.values());
-        fakeGames.clear();
-        const games = RunningGameStore.getRunningGames();
-        FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: removedGames, added: games, games });
-    }
-
-    if (fakeApplications.size > 0) {
-        fakeApplications.clear();
-    }
-}
-
 function completeQuest(quest: QuestValue) {
-    if (!settings.store.hasAcceptedToUsePlugin) {
-        stopAllFarming();
-        console.warn("Consent not accepted. Cannot complete quests.");
-        return;
-    }
-
     const isApp = typeof DiscordNative !== "undefined";
     if (!quest) {
         console.log("You don't have any uncompleted quests!");
     } else {
         const pid = Math.floor(Math.random() * 30000) + 1000;
 
-        const applicationId = quest.config.application.id;
-        const applicationName = quest.config.application.name;
         const { questName } = quest.config.messages;
         const taskConfig = quest.config.taskConfig ?? quest.config.taskConfigV2;
-        const taskName = ["WATCH_VIDEO", "PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP", "PLAY_ACTIVITY", "WATCH_VIDEO_ON_MOBILE"].find(x => taskConfig.tasks[x] != null);
+        if (!taskConfig?.tasks) {
+            console.log("Quest has no task configuration:", questName);
+            return;
+        }
+
+        const taskName = supportedTasks.find(x => taskConfig.tasks[x] != null);
         if (!taskName) {
             console.log("Unknown task type for quest:", questName);
             return;
         }
-        const secondsNeeded = taskConfig.tasks[taskName].target;
+        const taskData = taskConfig.tasks[taskName];
+        if (!taskData) return;
+
+        const applicationId = quest.config.application?.id ?? taskData.applications?.[0]?.id;
+        const applicationName = quest.config.application?.name ?? taskData.applications?.[0]?.name ?? questName;
+        const secondsNeeded = taskData.target;
         let secondsDone = quest.userStatus?.progress?.[taskName]?.value ?? 0;
+
+        if ((taskName === "PLAY_ON_DESKTOP" || taskName === "STREAM_ON_DESKTOP") && !applicationId) {
+            console.error("Quest is missing an application ID:", questName);
+            return;
+        }
 
         if (!isApp && taskName !== "WATCH_VIDEO" && taskName !== "WATCH_VIDEO_ON_MOBILE") {
             console.log("This no longer works in browser for non-video quests (" + taskName + "). Use the discord desktop app to complete the", questName, "quest!");
@@ -283,36 +243,39 @@ function completeQuest(quest: QuestValue) {
         switch (taskName) {
             case "WATCH_VIDEO":
             case "WATCH_VIDEO_ON_MOBILE":
-                const maxFuture = 10, speed = 7, interval = 1;
-                const enrolledAt = new Date(quest.userStatus.enrolledAt).getTime();
+                const speed = 7;
                 let completed = false;
                 const watchVideo = async () => {
-                    while (true) {
-                        const maxAllowed = Math.floor((Date.now() - enrolledAt) / 1000) + maxFuture;
-                        const diff = maxAllowed - secondsDone;
-                        const timestamp = secondsDone + speed;
+                    while (secondsDone < secondsNeeded) {
+                        if (!completingQuest.get(quest.id)) {
+                            console.log("Stopping completing quest:", questName);
+                            return;
+                        }
+
+                        const remaining = Math.min(speed, secondsNeeded - secondsDone);
+                        await new Promise(resolve => setTimeout(resolve, remaining * 1000));
 
                         if (!completingQuest.get(quest.id)) {
                             console.log("Stopping completing quest:", questName);
-                            completingQuest.set(quest.id, false);
-                            break;
+                            return;
                         }
 
-                        if (diff >= speed) {
-                            const res = await RestAPI.post({ url: `/quests/${quest.id}/video-progress`, body: { timestamp: Math.min(secondsNeeded, timestamp + Math.random()) } });
-                            completed = res.body.completed_at != null;
-                            secondsDone = Math.min(secondsNeeded, timestamp);
-                        }
+                        const timestamp = Math.min(secondsNeeded, secondsDone + speed);
+                        const res = await RestAPI.post({
+                            url: `/quests/${quest.id}/video-progress`,
+                            body: { timestamp: Math.min(secondsNeeded, timestamp + Math.random()) }
+                        });
+                        completed = res.body.completed_at != null;
+                        secondsDone = timestamp;
 
-                        if (timestamp >= secondsNeeded) {
-                            completingQuest.set(quest.id, false);
+                        if (completed) {
                             break;
                         }
-                        await new Promise(resolve => setTimeout(resolve, interval * 1000));
                     }
                     if (!completed) {
                         await RestAPI.post({ url: `/quests/${quest.id}/video-progress`, body: { timestamp: secondsNeeded } });
                     }
+                    completingQuest.set(quest.id, false);
                     console.log("Quest completed!");
                 };
                 watchVideo();
@@ -322,7 +285,7 @@ function completeQuest(quest: QuestValue) {
             case "PLAY_ON_DESKTOP":
                 RestAPI.get({ url: `/applications/public?application_ids=${applicationId}` }).then(res => {
                     const appData = res.body[0];
-                    const exeName = appData.executables?.find(x => x.os === "win32")?.name?.replace(">","") ?? appData.name.replace(/[\/\\:*?"<>|]/g, "");
+                    const exeName = appData.executables?.find(x => x.os === "win32")?.name?.replace(">", "") ?? appData.name.replace(/[/\\:*?"<>|]/g, "");
 
                     const fakeGame = {
                         cmdLine: `C:\\Program Files\\${appData.name}\\${exeName}`,
@@ -343,7 +306,8 @@ function completeQuest(quest: QuestValue) {
                     FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: realGames, added: [fakeGame], games: fakeGames2 });
 
                     const playOnDesktop = event => {
-                        if (event.questId !== quest.id) return;
+                        const eventQuestId = event.questId ?? event.userStatus?.questId;
+                        if (eventQuestId != null && eventQuestId !== quest.id) return;
                         const progress = quest.config.configVersion === 1 ? event.userStatus.streamProgressSeconds : Math.floor(event.userStatus.progress.PLAY_ON_DESKTOP.value);
                         console.log(`Quest progress ${questName}: ${progress}/${secondsNeeded}`);
 
@@ -378,7 +342,8 @@ function completeQuest(quest: QuestValue) {
                 fakeApplications.set(quest.id, fakeApp);
 
                 const streamOnDesktop = event => {
-                    if (event.questId !== quest.id) return;
+                    const eventQuestId = event.questId ?? event.userStatus?.questId;
+                    if (eventQuestId != null && eventQuestId !== quest.id) return;
                     const progress = quest.config.configVersion === 1 ? event.userStatus.streamProgressSeconds : Math.floor(event.userStatus.progress.STREAM_ON_DESKTOP.value);
                     console.log(`Quest progress ${questName}: ${progress}/${secondsNeeded}`);
 
@@ -408,7 +373,7 @@ function completeQuest(quest: QuestValue) {
                     console.log("Completing quest", questName, "-", quest.config.messages.questName);
 
                     while (true) {
-                        const res = await RestAPI.post({ url: `/quests/${quest.id}/heartbeat`, body: { stream_key: streamKey, terminal: false } });
+                        const res = await RestAPI.post({ url: `/quests/${quest.id}/heartbeat`, body: { stream_key: streamKey, application_id: String(applicationId || ""), terminal: false } });
                         const progress = res.body.progress.PLAY_ACTIVITY.value;
                         console.log(`Quest progress ${questName}: ${progress}/${secondsNeeded}`);
 
@@ -429,10 +394,212 @@ function completeQuest(quest: QuestValue) {
                 playActivity();
                 break;
 
+            case "ACHIEVEMENT_IN_ACTIVITY":
+                const achievementKey = getStreamKey();
+                if (!achievementKey) {
+                    console.error("No voice channel found for achievement heartbeat. Trying bypass directly.");
+                }
+
+                const completeAchievement = async () => {
+                    let achievementDone = false;
+
+                    // Phase 1: Try heartbeat spoof (works for some quests; most ACHIEVEMENT_IN_ACTIVITY
+                    // quests will return 403 and fall through to Phase 2 immediately).
+                    if (achievementKey) {
+                        const beat = { stream_key: achievementKey, application_id: String(applicationId || ""), terminal: false };
+                        let cur: number = quest.userStatus?.progress?.[taskName]?.value ?? 0;
+                        let failCount = 0;
+                        console.log(`[Achievement] Attempting heartbeat for "${questName}" (${cur}/${secondsNeeded})...`);
+
+                        while (cur < secondsNeeded && completingQuest.get(quest.id)) {
+                            try {
+                                const r = await RestAPI.post({ url: `/quests/${quest.id}/heartbeat`, body: beat });
+                                const newCur: number = r.body?.progress?.[taskName]?.value ?? r.body?.progress?.ACHIEVEMENT_IN_ACTIVITY?.value ?? cur;
+                                if (newCur > cur) {
+                                    cur = newCur;
+                                    console.log(`[Achievement] "${questName}" progress: ${cur}/${secondsNeeded}`);
+                                }
+                                failCount = 0;
+                                if (cur >= secondsNeeded) {
+                                    try { await RestAPI.post({ url: `/quests/${quest.id}/heartbeat`, body: { ...beat, terminal: true } }); }
+                                    catch { /* noop */ }
+                                    achievementDone = true;
+                                    break;
+                                }
+                            } catch (e: any) {
+                                failCount++;
+                                if (e?.status && [400, 403, 404, 409, 410].includes(e.status)) {
+                                    console.warn(`[Achievement] Heartbeat rejected (HTTP ${e.status}). Falling back to bypass.`);
+                                    break;
+                                }
+                                if (failCount >= 3) {
+                                    console.warn("[Achievement] Too many heartbeat failures. Falling back to bypass.");
+                                    break;
+                                }
+                            }
+                            await new Promise(resolve => setTimeout(resolve, 20 * 1000));
+                        }
+                    }
+
+                    // Phase 2: If heartbeat didn't finish, try Discord Says OAuth bypass
+                    if (!achievementDone && completingQuest.get(quest.id)) {
+                        if (!settings.store.farmAchievement) {
+                            console.warn(`[Achievement] OAuth bypass is off in settings; skipping "${questName}". Enable 'Farm Achievement' to allow this.`);
+                            completingQuest.set(quest.id, false);
+                            return;
+                        }
+
+                        const isApp = typeof DiscordNative !== "undefined";
+                        if (!isApp) {
+                            console.warn(`[Achievement] OAuth bypass requires the desktop app. Cannot complete "${questName}" in browser.`);
+                            completingQuest.set(quest.id, false);
+                            return;
+                        }
+
+                        const appId = String(applicationId || "");
+                        if (!appId || !/^\d+$/.test(appId)) {
+                            console.error(`[Achievement] No valid application ID for "${questName}". Cannot bypass.`);
+                            completingQuest.set(quest.id, false);
+                            return;
+                        }
+
+                        console.log(`[Achievement] Trying Discord Says OAuth bypass for "${questName}"...`);
+                        achievementDone = await bypassAchievement(quest.id, appId, secondsNeeded);
+                    }
+
+                    if (achievementDone) {
+                        console.log(`[Achievement] Quest "${questName}" completed!`);
+                    } else {
+                        console.warn(`[Achievement] Could not complete "${questName}". Both heartbeat and bypass failed.`);
+                    }
+                    completingQuest.set(quest.id, false);
+                };
+                completeAchievement();
+                break;
+
             default:
                 console.error("Unknown task type:", taskName);
                 completingQuest.set(quest.id, false);
                 break;
+        }
+    }
+}
+
+/**
+ * Build a stream key for heartbeat spoofing.
+ * Uses the current user's ID as the owner, and picks the first available
+ * DM channel or guild voice channel.
+ */
+function getStreamKey(): string | null {
+    try {
+        const ownerId = UserStore.getCurrentUser()?.id;
+        if (!ownerId) return null;
+
+        const dmChan = ChannelStore.getSortedPrivateChannels()?.[0]?.id;
+        if (dmChan) return `call:${dmChan}:${ownerId}`;
+
+        const guilds = GuildChannelStore.getAllGuilds() ?? {};
+        for (const g of Object.values<any>(guilds)) {
+            const voiceChan = g?.VOCAL?.[0]?.channel;
+            if (voiceChan?.id) {
+                const guildId = voiceChan.guild_id ?? g?.id;
+                if (guildId) return `guild:${guildId}:${voiceChan.id}:${ownerId}`;
+            }
+        }
+        return null;
+    } catch (e: any) {
+        console.error("[Achievement] Stream key lookup error:", e?.message);
+        return null;
+    }
+}
+
+/**
+ * OAuth2 → discordsays.com bypass for ACHIEVEMENT_IN_ACTIVITY.
+ * Flow:
+ *   1) Snapshot existing OAuth grants for the app
+ *   2) /oauth2/authorize the quest's app (returns code in location URL)
+ *   3) /applications/{appId}/proxy-tickets (returns proxy ticket)
+ *   4) POST {appId}.discordsays.com/.proxy/acf/authorize {code} → DS token
+ *   5) POST {appId}.discordsays.com/.proxy/acf/quest/progress {progress: target}
+ *   6) Revoke only the grant we created
+ */
+async function bypassAchievement(questId: string, appId: string, target: number): Promise<boolean> {
+    // Snapshot grants before authorizing so cleanup only revokes what we create
+    let preGrantIds: Set<string> | undefined;
+    try {
+        const before: any = await RestAPI.get({ url: "/oauth2/tokens" });
+        preGrantIds = new Set(
+            (before?.body || []).filter((tk: any) => tk.application?.id === appId).map((tk: any) => tk.id)
+        );
+    } catch (e: any) {
+        console.warn("[Achievement] Couldn't snapshot existing grants; aborting:", e?.message);
+        return false;
+    }
+
+    try {
+        // Step 1: Authorize the quest app
+        const authRes: any = await RestAPI.post({
+            url: "/oauth2/authorize",
+            query: {
+                response_type: "code",
+                client_id: appId,
+                scope: "identify applications.commands applications.entitlements"
+            },
+            body: {
+                permissions: "0",
+                authorize: true,
+                integration_type: 1,
+                location_context: { guild_id: "10000", channel_id: "10000", channel_type: 10000 }
+            }
+        });
+        const location: string | undefined = authRes?.body?.location;
+        if (!location) throw new Error("no location in /oauth2/authorize response");
+        const authCode = new URL(location).searchParams.get("code");
+        if (!authCode) throw new Error("no code in authorize location");
+
+        // Step 2: Get proxy ticket
+        const ticketRes: any = await RestAPI.post({ url: `/applications/${appId}/proxy-tickets`, body: {} });
+        const proxyTicket: string | undefined = ticketRes?.body?.ticket;
+        if (!proxyTicket) throw new Error("no proxy ticket");
+
+        const referrer = `https://${appId}.discordsays.com/?instance_id=example-cl-instance&platform=desktop&discord_proxy_ticket=${encodeURIComponent(proxyTicket)}`;
+
+        // Step 3: Authorize with Discord Says (via native IPC to bypass CSP)
+        const dsAuthRes = await Native.discordsaysAuthorize({ appId, questId, authCode, referrer });
+        if (!dsAuthRes.ok) throw new Error(`discordsays authorize ${dsAuthRes.status}`);
+        let dsToken: string | undefined;
+        try { dsToken = (JSON.parse(dsAuthRes.body) as { token?: string }).token; }
+        catch { throw new Error("discordsays returned non-JSON: " + String(dsAuthRes.body).slice(0, 120)); }
+        if (!dsToken) throw new Error("no discordsays token");
+
+        // Step 4: Report progress
+        const progRes = await Native.discordsaysProgress({ appId, questId, token: dsToken, target, referrer });
+        if (!progRes.ok) throw new Error(`discordsays progress ${progRes.status}`);
+
+        console.log(`[Achievement] OAuth bypass succeeded for quest ${questId}.`);
+        return true;
+    } catch (e: any) {
+        const code = e?.body?.code;
+        if (code === 50165) {
+            console.warn("[Achievement] Activity is age-gated or delisted. Discord blocks the proxy ticket.");
+            return false;
+        }
+        console.error("[Achievement] OAuth bypass failed:", e?.message ?? e);
+        return false;
+    } finally {
+        // Cleanup: revoke only the grant we created
+        if (preGrantIds) {
+            try {
+                const after: any = await RestAPI.get({ url: "/oauth2/tokens" });
+                const ours = (after?.body || []).filter(
+                    (tk: any) => tk.application?.id === appId && !preGrantIds!.has(tk.id)
+                );
+                for (const g of ours) {
+                    await RestAPI.del({ url: `/oauth2/tokens/${g.id}` });
+                }
+            } catch (e: any) {
+                console.warn("[Achievement] Deauthorize cleanup failed (non-fatal):", e?.message);
+            }
         }
     }
 }

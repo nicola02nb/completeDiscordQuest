@@ -13,3 +13,5 @@ export const RunningGameStore: t.RunningGameStore = findStoreLazy("RunningGameSt
 export const QuestsStore: t.QuestsStore = findByPropsLazy("getQuest");
 export const ChannelStore: t.ChannelStore = findStoreLazy("ChannelStore");
 export const GuildChannelStore: t.GuildChannelStore = findStoreLazy("GuildChannelStore");
+export const UserStore = findStoreLazy("UserStore") as { getCurrentUser(): { id: string; } | null; };
+
