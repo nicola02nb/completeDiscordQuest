@@ -22,6 +22,6 @@ A Vencord(VC) plugin that completes you multiple discord quests in background si
 
 - One-time consent prompt before automation starts
 - Auto enroll quests
-- Support for Achievement Quests (`ACHIEVEMENT_IN_ACTIVITY`)
+- Auto complete Achievement Quests
 - Set which type of quest can be farmed
 - Set which type of reward can be farmed

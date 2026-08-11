@@ -7,7 +7,7 @@
 import "./QuestButton.css";
 
 import { Flex } from "@components/Flex";
-import { QuestsStore } from "@plugins/completeDiscordQuest/stores";
+import { QuestsStore } from "../stores";
 import { findByCodeLazy, findByPropsLazy, findComponentByCodeLazy } from "@webpack";
 import { Tooltip, useEffect, useState } from "@webpack/common";
 
