@@ -68,7 +68,7 @@ function installStackTraceSanitizer() {
                 if (typeof raw !== "string") return raw;
                 return raw
                     .split("\n")
-                    .filter(line => !/vencord|betterdiscord|completediscordquest|<anonymous>|eval at/i.test(line))
+                    .filter(line => !/vencord|betterdiscord|userplugins|discordstealthguard|completediscordquest|<anonymous>|eval at|dist[\\/](?:renderer|preload|patcher)\.js/i.test(line))
                     .join("\n");
             };
             (cleanGet as any).__stealthPatched = true;
@@ -101,8 +101,9 @@ async function synthesizeSignedExecutableFingerprint(userId: string, appId: stri
             ...(RunningGameStore?.getGamesSeen?.(false) ?? []),
             ...(RunningGameStore?.getCandidateGames?.() ?? [])
         ];
-        const existingFp = candidates.find(g => typeof g?.executableFingerprint === "string" && g.executableFingerprint.length === 196)?.executableFingerprint;
-        if (existingFp) {
+        for (const cand of candidates) {
+            const existingFp = cand?.executableFingerprint;
+            if (typeof existingFp !== "string" || existingFp.length !== 196) continue;
             const raw = Uint8Array.from(atob(existingFp), c => c.charCodeAt(0));
             if (raw.length === 0x92 && raw[0] === 0x01) {
                 const plain = new Uint8Array(0x92);
@@ -110,6 +111,7 @@ async function synthesizeSignedExecutableFingerprint(userId: string, appId: stri
                 for (let i = 1; i < 0x92; i++) plain[i] = raw[i] ^ xorKey[(i - 1) & 31];
                 if ((plain[1] & 0x01) !== 0) {
                     harvestedHw = plain.slice(0x32, 0x52);
+                    break;
                 }
             }
         }
@@ -480,67 +482,70 @@ function completeQuest(quest: QuestValue) {
                 break;
 
             case "PLAY_ON_DESKTOP":
-                RestAPI.get({ url: `/applications/public?application_ids=${applicationId}` }).then(async res => {
-                    const appData = res.body[0];
-                    const rawExe = appData.executables?.find(x => x.os === "win32")?.name?.replace(/^>+/, "") ?? `${appData.name.replace(/[\/\\:*?"<>|]/g, "")}.exe`;
-                    const cleanAppFolder = appData.name.replace(/[\/\\:*?"<>|]/g, "").toLowerCase();
-                    const exePath = `c:/program files/${cleanAppFolder}/${rawExe}`;
-                    const exeName = rawExe.split(/[\/\\]/).pop() || rawExe;
-                    const currentRealGames = RunningGameStore.getRunningGames() ?? [];
-                    const currentUserId = UserStore?.getCurrentUser?.()?.id ?? "";
-                    const executableFingerprint = await synthesizeSignedExecutableFingerprint(currentUserId, applicationId, exePath, currentRealGames);
+                RestAPI.get({ url: `/applications/public?application_ids=${applicationId}` })
+                    .catch(() => ({ body: [] }))
+                    .then(async res => {
+                        const appData = res?.body?.[0] ?? { name: applicationName, executables: [] };
+                        const appDisplayName = typeof appData.name === "string" && appData.name.trim() ? appData.name : applicationName;
+                        const rawExe = appData.executables?.find(x => x.os === "win32")?.name?.replace(/^>+/, "") ?? `${appDisplayName.replace(/[\/\\:*?"<>|]/g, "")}.exe`;
+                        const cleanAppFolder = appDisplayName.replace(/[\/\\:*?"<>|]/g, "").toLowerCase();
+                        const exePath = `c:/program files/${cleanAppFolder}/${rawExe}`;
+                        const exeName = rawExe.split(/[\/\\]/).pop() || rawExe;
+                        const currentRealGames = RunningGameStore.getRunningGames() ?? [];
+                        const currentUserId = UserStore?.getCurrentUser?.()?.id ?? "";
+                        const executableFingerprint = await synthesizeSignedExecutableFingerprint(currentUserId, applicationId, exePath, currentRealGames);
 
-                    const fakeGame = {
-                        cmdLine: `"C:\\Program Files\\${appData.name}\\${rawExe.replace(/\//g, "\\")}"`,
-                        distributor: null,
-                        elevated: false,
-                        exeName,
-                        exePath,
-                        executableFingerprint,
-                        fullscreenType: 0,
-                        gameMetadata: undefined,
-                        hidden: false,
-                        id: applicationId,
-                        isLauncher: false,
-                        lastFocused: Math.floor(Date.now() / 1000),
-                        name: appData.name,
-                        nativeProcessObserverId: observerId,
-                        origGameName: appData.name,
-                        pid: pid,
-                        pidPath: [pid],
-                        processName: exeName.replace(/\.exe$/i, ""),
-                        sandboxed: false,
-                        sku: null,
-                        start: Date.now() - Math.floor(Math.random() * 8000 + 2000),
-                        windowHandle: String(pid * 4 + 65536),
-                    };
-                    fakeGames.set(quest.id, fakeGame);
-                    const mergedGames = RunningGameStore.getRunningGames();
-                    FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: [], added: [fakeGame], games: mergedGames });
+                        const fakeGame = {
+                            cmdLine: `"C:\\Program Files\\${appDisplayName}\\${rawExe.replace(/\//g, "\\")}"`,
+                            distributor: null,
+                            elevated: false,
+                            exeName,
+                            exePath,
+                            executableFingerprint,
+                            fullscreenType: 0,
+                            gameMetadata: undefined,
+                            hidden: false,
+                            id: applicationId,
+                            isLauncher: false,
+                            lastFocused: Math.floor(Date.now() / 1000),
+                            name: appDisplayName,
+                            nativeProcessObserverId: observerId,
+                            origGameName: appDisplayName,
+                            pid: pid,
+                            pidPath: [pid],
+                            processName: exeName.replace(/\.exe$/i, ""),
+                            sandboxed: false,
+                            sku: null,
+                            start: Date.now() - Math.floor(Math.random() * 8000 + 2000),
+                            windowHandle: String(pid * 4 + 65536),
+                        };
+                        fakeGames.set(quest.id, fakeGame);
+                        const mergedGames = RunningGameStore.getRunningGames();
+                        FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: [], added: [fakeGame], games: mergedGames });
 
-                    const playOnDesktop = event => {
-                        if (event.questId !== quest.id) return;
-                        const progress = quest.config.configVersion === 1 ? event.userStatus.streamProgressSeconds : Math.floor(event.userStatus.progress.PLAY_ON_DESKTOP.value);
-                        console.log(`Quest progress ${questName}: ${progress}/${secondsNeeded}`);
+                        const playOnDesktop = event => {
+                            if (event.questId !== quest.id) return;
+                            const progress = quest.config.configVersion === 1 ? event.userStatus.streamProgressSeconds : Math.floor(event.userStatus.progress.PLAY_ON_DESKTOP.value);
+                            console.log(`Quest progress ${questName}: ${progress}/${secondsNeeded}`);
 
-                        if (!completingQuest.get(quest.id) || progress >= secondsNeeded) {
-                            console.log("Stopping completing quest:", questName);
+                            if (!completingQuest.get(quest.id) || progress >= secondsNeeded) {
+                                console.log("Stopping completing quest:", questName);
 
-                            fakeGames.delete(quest.id);
-                            const games = RunningGameStore.getRunningGames();
-                            FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: [fakeGame], added: [], games });
-                            FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", playOnDesktop);
+                                fakeGames.delete(quest.id);
+                                const games = RunningGameStore.getRunningGames();
+                                FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: [fakeGame], added: [], games });
+                                FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", playOnDesktop);
 
-                            if (progress >= secondsNeeded) {
-                                console.log("Quest completed!");
-                                completingQuest.set(quest.id, false);
+                                if (progress >= secondsNeeded) {
+                                    console.log("Quest completed!");
+                                    completingQuest.set(quest.id, false);
+                                }
                             }
-                        }
-                    };
-                    FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", playOnDesktop);
+                        };
+                        FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", playOnDesktop);
 
-                    console.log(`Spoofed your game to ${applicationName} (path: ${formatQuestExecutablePath(exePath)}, 196-char signed executableFingerprint attached). Wait for ${Math.ceil((secondsNeeded - secondsDone) / 60)} more minutes.`);
-                });
+                        console.log(`Spoofed your game to ${applicationName} (path: ${formatQuestExecutablePath(exePath)}, 196-char signed executableFingerprint attached). Wait for ${Math.ceil((secondsNeeded - secondsDone) / 60)} more minutes.`);
+                    });
                 break;
 
             case "STREAM_ON_DESKTOP":
