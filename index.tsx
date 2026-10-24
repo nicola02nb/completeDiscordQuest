@@ -47,12 +47,39 @@ function scrubLaunchSignatureUuid(uuid: string | undefined | null): string | und
 
 function scrubCachedSuperProperties() {
     try {
-        const props = SuperPropertiesStore?.getSuperProperties?.();
-        if (props?.launch_signature) {
-            props.launch_signature = scrubLaunchSignatureUuid(props.launch_signature);
-        }
-        if (props && "has_client_mods" in props) {
-            props.has_client_mods = false;
+        if (!SuperPropertiesStore) return;
+        const scrubObj = (props: any) => {
+            if (props && typeof props === "object") {
+                if (props.launch_signature) {
+                    props.launch_signature = scrubLaunchSignatureUuid(props.launch_signature);
+                }
+                if ("has_client_mods" in props) {
+                    props.has_client_mods = false;
+                }
+            }
+            return props;
+        };
+        scrubObj(SuperPropertiesStore.getSuperProperties?.());
+        if (typeof SuperPropertiesStore.getSuperPropertiesBase64 === "function" && !(SuperPropertiesStore.getSuperPropertiesBase64 as any).__stealthPatched) {
+            const origGetB64 = SuperPropertiesStore.getSuperPropertiesBase64.bind(SuperPropertiesStore);
+            let lastRaw = "";
+            let lastClean = "";
+            const wrappedGetB64 = function (...args: any[]) {
+                const raw = origGetB64(...args);
+                if (typeof raw !== "string" || !raw) return raw;
+                if (raw === lastRaw && lastClean) return lastClean;
+                try {
+                    const parsed = JSON.parse(atob(raw));
+                    scrubObj(parsed);
+                    lastRaw = raw;
+                    lastClean = btoa(JSON.stringify(parsed));
+                    return lastClean;
+                } catch {
+                    return raw;
+                }
+            };
+            (wrappedGetB64 as any).__stealthPatched = true;
+            SuperPropertiesStore.getSuperPropertiesBase64 = wrappedGetB64;
         }
     } catch {}
 }
@@ -223,10 +250,10 @@ export default definePlugin({
             }
         },
         {
-            find: "launchSignature:",
+            find: "extendSuperProperties({launch_signature:",
             replacement: {
-                match: /launchSignature:(\i)\(\)/,
-                replace: "launchSignature:$self.scrubLaunchSignature($1())"
+                match: /launch_signature:(\i)/g,
+                replace: "launch_signature:$self.scrubLaunchSignature($1)"
             }
         }
     ],
