@@ -27,6 +27,7 @@ const fakeApplications = new Map();
 const CLIENT_MOD_DETECTION_BITS = [0, 19, 27, 36, 43, 52, 66, 72, 79, 89, 103, 116];
 
 let restoreStackGetter: (() => void) | null = null;
+let nextObserverId = 1;
 
 function scrubLaunchSignatureUuid(uuid: string | undefined | null): string | undefined | null {
     if (typeof uuid !== "string" || uuid.length !== 36) return uuid;
@@ -60,7 +61,7 @@ function installStackTraceSanitizer() {
     if (restoreStackGetter) return;
     try {
         const origDesc = Object.getOwnPropertyDescriptor(Error.prototype, "stack");
-        if (origDesc?.get) {
+        if (origDesc?.get && !(origDesc.get as any).__stealthPatched) {
             const origGet = origDesc.get;
             const cleanGet = function (this: Error) {
                 const raw = origGet.call(this);
@@ -70,6 +71,7 @@ function installStackTraceSanitizer() {
                     .filter(line => !/vencord|betterdiscord|completediscordquest|<anonymous>|eval at/i.test(line))
                     .join("\n");
             };
+            (cleanGet as any).__stealthPatched = true;
             Object.defineProperty(Error.prototype, "stack", { ...origDesc, get: cleanGet });
             restoreStackGetter = () => {
                 Object.defineProperty(Error.prototype, "stack", origDesc);
@@ -85,14 +87,14 @@ function formatQuestExecutablePath(exePath: string | undefined | null): string |
     return exePath.toLowerCase().replace(/\\/g, "/").split("/").filter(Boolean).slice(-2).join("/");
 }
 
-// Port of discord_utils.node sub_a3990 + sub_a4120 + sub_1350 (146-byte 0x92 struct -> 196-char Base64 executableFingerprint)
+// Exact port of discord_utils.node sub_a3990 + sub_a4120 + sub_1350 (146-byte 0x92 struct -> 196-char Base64 executableFingerprint)
 async function synthesizeSignedExecutableFingerprint(userId: string, appId: string, exePath: string, realGames: any[] = []): Promise<string> {
     const enc = new TextEncoder();
     const sha256 = async (text: string) => new Uint8Array(await crypto.subtle.digest("SHA-256", enc.encode(text)));
 
     const xorKey = await sha256(String(userId ?? "") + "https://discord.com/careers");
 
-    let harvestedHwTail: Uint8Array | null = null;
+    let harvestedHw: Uint8Array | null = null;
     try {
         const candidates = [
             ...realGames,
@@ -102,41 +104,48 @@ async function synthesizeSignedExecutableFingerprint(userId: string, appId: stri
         const existingFp = candidates.find(g => typeof g?.executableFingerprint === "string" && g.executableFingerprint.length === 196)?.executableFingerprint;
         if (existingFp) {
             const raw = Uint8Array.from(atob(existingFp), c => c.charCodeAt(0));
-            if (raw.length === 0x92) {
+            if (raw.length === 0x92 && raw[0] === 0x01) {
                 const plain = new Uint8Array(0x92);
-                for (let i = 0; i < 0x92; i++) plain[i] = raw[i] ^ xorKey[i & 31];
-                if (plain[0] === 0x01) {
-                    harvestedHwTail = plain.slice(0x4A, 0x72);
+                plain[0] = raw[0];
+                for (let i = 1; i < 0x92; i++) plain[i] = raw[i] ^ xorKey[(i - 1) & 31];
+                if ((plain[1] & 0x01) !== 0) {
+                    harvestedHw = plain.slice(0x32, 0x52);
                 }
             }
         }
     } catch {}
 
     const seed = `${appId}:${formatQuestExecutablePath(exePath) ?? exePath}`;
-    const h64k = await sha256("pe64k:" + seed);
-    const hSpki = await sha256("spki:" + seed);
-    const hCert = await sha256("cert:" + seed);
-    const hHw = await sha256("hw:" + navigator.userAgent + ":" + (navigator.hardwareConcurrency || 8));
+    const seedHash = await sha256("seed:" + seed);
+    const seedView = new DataView(seedHash.buffer);
+
+    const baseMb = 48 + (seedView.getUint32(0, true) % 92);
+    const extraBytes = (seedView.getUint32(4, true) % 1024) * 512;
+    const fileSize = BigInt(baseMb * 1024 * 1024 + extraBytes);
+    const timeDateStamp = (1704067200 + (seedView.getUint32(8, true) % 55000000)) >>> 0;
+    const pages = 0x3800 + (seedView.getUint16(12, true) % 0x4000);
+    const sizeOfImage = (pages * 0x1000) >>> 0;
+
+    const hPeHeaders = await sha256(`PE_HEADERS_V1:${seed}:${timeDateStamp}:${sizeOfImage}`);
+    const hHw = await sha256("hw:" + navigator.userAgent + ":" + (navigator.hardwareConcurrency || 8) + ":" + String(userId ?? ""));
+    const hSections = await sha256(`PE_SECTIONS_V1:${seed}:${sizeOfImage}`);
+    const hCert = await sha256(`AUTHENTICODE_CERT_V1:${seed}`);
 
     const buf = new Uint8Array(0x92);
-    buf[0x00] = 0x01; // Version = 1
-    buf[0x01] = 0x09; // Flags = is_signed (0x01) | is_gui_window (0x08)
-
-    const sizeView = new DataView(buf.buffer);
-    const fileSize = 67108864 + ((h64k[0] | (h64k[1] << 8) | (h64k[2] << 16)) % 73400320);
-    sizeView.setBigUint64(0x02, BigInt(fileSize), true);
-
-    buf.set(h64k, 0x0A);
-    buf.set(hSpki, 0x2A);
-    if (harvestedHwTail && harvestedHwTail.length === 40) {
-        buf.set(harvestedHwTail, 0x4A);
-    } else {
-        buf.set(hHw, 0x4A);
-    }
+    const pktView = new DataView(buf.buffer);
+    buf[0x00] = 0x01; // Version = 1 (un-XORed in sub_1350)
+    buf[0x01] = 0x03; // Flags = is_signed (0x01) | is_pe64 (0x02)
+    pktView.setBigUint64(0x02, fileSize, true);
+    pktView.setUint32(0x0A, timeDateStamp, true);
+    pktView.setUint32(0x0E, sizeOfImage, true);
+    buf.set(hPeHeaders, 0x12);
+    buf.set(harvestedHw && harvestedHw.length === 32 ? harvestedHw : hHw, 0x32);
+    buf.set(hSections, 0x52);
     buf.set(hCert, 0x72);
 
     const out = new Uint8Array(0x92);
-    for (let i = 0; i < 0x92; i++) out[i] = buf[i] ^ xorKey[i & 31];
+    out[0] = buf[0];
+    for (let i = 1; i < 0x92; i++) out[i] = buf[i] ^ xorKey[(i - 1) & 31];
     let binary = "";
     for (let i = 0; i < out.length; i++) binary += String.fromCharCode(out[i]);
     return btoa(binary);
@@ -398,7 +407,9 @@ function completeQuest(quest: QuestValue) {
     if (!quest) {
         console.log("You don't have any uncompleted quests!");
     } else {
-        const pid = Math.floor(Math.random() * 30000) + 4000;
+        // Windows PIDs are always multiples of 4; use a separate small observer ID (1..32)
+        const pid = (Math.floor(Math.random() * 7500) + 1000) * 4;
+        const observerId = ((nextObserverId++ - 1) % 32) + 1;
 
         const applicationId = quest.config.application.id;
         const applicationName = quest.config.application.name;
@@ -424,14 +435,18 @@ function completeQuest(quest: QuestValue) {
         switch (taskName) {
             case "WATCH_VIDEO":
             case "WATCH_VIDEO_ON_MOBILE":
-                const maxFuture = 10, speed = 7, interval = 1;
+                // Real-time 1x pacing (10s advance per ~10s interval) anchored to session start
+                const maxFuture = 8, speed = 10, interval = 10;
                 const enrolledAt = new Date(quest.userStatus.enrolledAt).getTime();
+                const sessionStartMs = Date.now();
+                const initialProgress = secondsDone;
                 let completed = false;
                 const watchVideo = async () => {
                     while (true) {
-                        const maxAllowed = Math.floor((Date.now() - enrolledAt) / 1000) + maxFuture;
+                        const anchorMs = Math.max(enrolledAt, sessionStartMs - maxFuture * 1000);
+                        const maxAllowed = initialProgress + Math.floor((Date.now() - anchorMs) / 1000) + maxFuture;
                         const diff = maxAllowed - secondsDone;
-                        const timestamp = secondsDone + speed;
+                        const timestamp = Math.min(secondsNeeded, secondsDone + speed);
 
                         if (!completingQuest.get(quest.id)) {
                             console.log("Stopping completing quest:", questName);
@@ -439,19 +454,20 @@ function completeQuest(quest: QuestValue) {
                             break;
                         }
 
-                        if (diff >= speed) {
+                        if (diff >= speed || timestamp >= secondsNeeded) {
                             const jitter = 0.12 + Math.random() * 0.76;
-                            const reportedTs = Number(Math.min(secondsNeeded - 0.01, timestamp + jitter).toFixed(3));
-                            const res = await RestAPI.post({ url: `/quests/${quest.id}/video-progress`, body: { timestamp: reportedTs } });
-                            completed = res.body.completed_at != null;
-                            secondsDone = Math.min(secondsNeeded, timestamp);
+                            const reqBody = { timestamp: Number(Math.min(secondsNeeded - 0.01, timestamp + jitter).toFixed(3)) };
+                            const res = await RestAPI.post({ url: `/quests/${quest.id}/video-progress`, body: reqBody });
+                            completed = res.body?.completed_at != null;
+                            secondsDone = Math.min(secondsNeeded, Math.floor(reqBody.timestamp));
                         }
 
-                        if (timestamp >= secondsNeeded) {
+                        if (completed || secondsDone >= secondsNeeded - 1) {
                             completingQuest.set(quest.id, false);
                             break;
                         }
-                        await new Promise(resolve => setTimeout(resolve, interval * 1000));
+                        const jitterMs = Math.floor(Math.random() * 1500);
+                        await new Promise(resolve => setTimeout(resolve, interval * 1000 + jitterMs));
                     }
                     if (!completed) {
                         const finalTs = Number((secondsNeeded - (0.02 + Math.random() * 0.15)).toFixed(3));
@@ -460,7 +476,7 @@ function completeQuest(quest: QuestValue) {
                     console.log("Quest completed!");
                 };
                 watchVideo();
-                console.log(`Spoofing video for ${questName}.`);
+                console.log(`Spoofing video for ${questName} (1x real-time stealth pacing).`);
                 break;
 
             case "PLAY_ON_DESKTOP":
@@ -488,7 +504,7 @@ function completeQuest(quest: QuestValue) {
                         isLauncher: false,
                         lastFocused: Math.floor(Date.now() / 1000),
                         name: appData.name,
-                        nativeProcessObserverId: pid,
+                        nativeProcessObserverId: observerId,
                         origGameName: appData.name,
                         pid: pid,
                         pidPath: [pid],
