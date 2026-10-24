@@ -14,26 +14,31 @@ import { QuestsStore } from "../stores";
 
 const QuestIcon = findByCodeLazy("\"M7.5 21.7a8.95");
 const { navigateToQuestHome } = findByPropsLazy("navigateToQuestHome");
-const TopBarButton = findComponentByCodeLazy("badgePosition", "icon");
+const TopBarButton = findComponentByCodeLazy(".HEADER_BAR_BADGE_BOTTOM,", 'position:"bottom"');
 const SettingsBarButton = findComponentByCodeLazy("keyboardShortcut", "positionKey");
 const CountBadge = findComponentByCodeLazy("renderBadgeCount", "disableColor");
 
 function questsStatus() {
-    const availableQuests = [...QuestsStore.quests.values()];
-    return availableQuests.reduce((acc, x) => {
-        if (new Date(x.config.expiresAt).getTime() < Date.now()) {
-            acc.expired++;
-        } else if (x.userStatus?.claimedAt) {
-            acc.claimed++;
-        } else if (x.userStatus?.completedAt) {
-            acc.claimable++;
-        } else if (x.userStatus?.enrolledAt) {
-            acc.enrolled++;
-        } else {
-            acc.enrollable++;
-        }
-        return acc;
-    }, { enrollable: 0, enrolled: 0, claimable: 0, claimed: 0, expired: 0 });
+    try {
+        const availableQuests = QuestsStore?.quests ? [...QuestsStore.quests.values()] : [];
+        return availableQuests.reduce((acc, x) => {
+            if (!x?.config?.expiresAt) return acc;
+            if (new Date(x.config.expiresAt).getTime() < Date.now()) {
+                acc.expired++;
+            } else if (x.userStatus?.claimedAt) {
+                acc.claimed++;
+            } else if (x.userStatus?.completedAt) {
+                acc.claimable++;
+            } else if (x.userStatus?.enrolledAt) {
+                acc.enrolled++;
+            } else {
+                acc.enrollable++;
+            }
+            return acc;
+        }, { enrollable: 0, enrolled: 0, claimable: 0, claimed: 0, expired: 0 });
+    } catch {
+        return { enrollable: 0, enrolled: 0, claimable: 0, claimed: 0, expired: 0 };
+    }
 }
 
 export function QuestsCount() {
