@@ -27,35 +27,36 @@ we identified the exact client-side and server-side detection vectors that cause
 
 ## 2. Native Process Fingerprinting (`discord_utils.node`: `sub_a3990` -> `sub_a4120` -> `sub_1350`)
 
-When a real game is detected by Discord's native process observer (`setObservedGamesCallback` in `discord_utils.node`), function `sub_a3990` (`0x1800a3990`) invokes `sub_a4120` (`0x1800a4120`) to construct a **146-byte (`0x92`) binary fingerprint** for the running `.exe` and encrypts/obfuscates it in `sub_1350` (`0x180001350`) into a **196-character Base64 string** named **`executableFingerprint`**.
+When a real game is detected by Discord's native process observer (`setObservedGamesCallback` in `discord_utils.node`), function `sub_a3990` (`0x1800a3990`) invokes `sub_a4120` (`0x1800a4120`), `sub_a3f60` (`0x1800a3f60`), and `sub_1350` (`0x180001350`) to construct and encrypt a **146-byte (`0x92`) binary fingerprint** for the running `.exe` into a **196-character Base64 string** named **`executableFingerprint`**.
 
-### 2.1 Binary Layout of the 146-Byte (`0x92`) Struct (`sub_a4120`)
+### 2.1 Binary Layout of the 146-Byte (`0x92`) Struct (`sub_1350` at `0x180001350`)
 
 | Offset | Size | Field | Native Source in `discord_utils.node` |
 | :--- | :--- | :--- | :--- |
-| `0x00` | `1 B` | `version` | Always `0x01` (`mov byte ptr [rbp-29h], 1` at `0x1800a4173`) |
-| `0x01` | `1 B` | `flags` | Bitfield: `Bit 0 (0x01)` = `is_signed` (`WinVerifyTrust == 0` at `0x1800a4224`), `Bit 1 (0x02)` = `is_elevated` (`TokenElevation`), `Bit 2 (0x04)` = `is_appcontainer` (`TokenIsAppContainer`), `Bit 3 (0x08)` = `is_gui_window` (`GetGUIThreadInfo`) |
-| `0x02..0x09` | `8 B` | `file_size` | `uint64 LE` from `GetFileInformationByHandleEx` (`FileStandardInfo.EndOfFile` at `0x1800a4503`) |
-| `0x0A..0x29` | `32 B` | `first_64kb_sha256` | OpenSSL EVP `SHA-256` of the first `65,536` bytes (`0x10000`) of the executable file (`ReadFile` at `0x1800a4576`) |
-| `0x2A..0x49` | `32 B` | `spki_sha256` | `SHA-256` of ASN.1 DER `CERT_INFO.SubjectPublicKeyInfo` (`CryptEncodeObjectEx` + `SHA-256` via `CryptQueryObject` / `CertFindCertificateInStore` at `0x1800a435d`) |
-| `0x4A..0x69` | `32 B` | `hw_sha256` | Hardware fingerprint from `sub_116790` (`0x180116790`): `SHA-256(RegGetValueW("HKLM\\SOFTWARE\\Microsoft\\Cryptography\\MachineGuid") \|\| CPUID(0x80000002..4) \|\| GlobalMemoryStatusEx.ullTotalPhys_GiB)` |
-| `0x6A..0x71` | `8 B` | `hw_tail` | Zero-padded tail (`0x00 * 8`) |
-| `0x72..0x91` | `32 B` | `cert_sha256` | `SHA-256` of full leaf X.509 certificate (`CERT_CONTEXT.pbCertEncoded`, `cbCertEncoded`) |
+| `0x00` | `1 B` | `version` | Always `0x01` (un-XORed plaintext header byte in `sub_1350`) |
+| `0x01` | `1 B` | `flags` | Bitfield (`0x03` for signed PE64): `Bit 0 (0x01)` = `is_signed` (`WinVerifyTrust == 0` at `0x1800a4224`), `Bit 1 (0x02)` = `is_pe64` (`OptionalHeader.Magic == 0x20B` at `0x1800a3d3b`) |
+| `0x02..0x09` | `8 B` | `file_size` | `uint64 LE` from `GetFileSizeEx` (`0x1800a3b97`) |
+| `0x0A..0x0D` | `4 B` | `time_date_stamp` | `uint32 LE` PE COFF `FileHeader.TimeDateStamp` (`e_lfanew + 0x08`) |
+| `0x0E..0x11` | `4 B` | `size_of_image` | `uint32 LE` PE `OptionalHeader.SizeOfImage` (`e_lfanew + 0x50`, page-aligned) |
+| `0x12..0x31` | `32 B` | `pe_headers_sha256` | `SHA-256` of DOS + NT + Optional PE headers (`0x1800a3cb3..0x1800a3cd2`) |
+| `0x32..0x51` | `32 B` | `hw_sha256` | Hardware + user hash from `sub_a3f60` (`0x1800a3f60`): `SHA-256(RegGetValueW("HKLM\\SOFTWARE\\Microsoft\\Cryptography\\MachineGuid") \|\| userId)` |
+| `0x52..0x71` | `32 B` | `sections_sha256` | `SHA-256` of the PE `IMAGE_SECTION_HEADER` table (`NumSections * 40` bytes at `0x1800a3cd7..0x1800a3d16`) |
+| `0x72..0x91` | `32 B` | `cert_sha256` | Authenticode certificate hash from `sub_a4120` (`0x1800a4120`): `SHA-256(UTF8(Publisher_CN) \|\| SHA256(SubjectPublicKeyInfo))` |
 
-### 2.2 Stream Obfuscation (`sub_1350` at `0x180001350`)
+### 2.2 Stream Obfuscation (`sub_1350` at `0x180001350` & `sub_116790` at `0x180116790`)
 
 Before returning `executableFingerprint` to JavaScript (`RunningGameStore`), `sub_1350` derives a 32-byte key:
 $$\text{Key} = \text{SHA-256}(\text{userId} \mathbin{\Vert} \text{"https://discord.com/careers"})$$
-and XORs all 146 bytes (`i = 0..145`):
-$$\text{cipher}[i] = \text{plain}[i] \oplus \text{Key}[i \bmod 32]$$
-Finally, the 146-byte buffer is Base64-encoded into a **196-character string** (`executableFingerprint`).
+keeps byte `0x00` (`version = 0x01`) un-XORed, and XORs bytes `i = 1..145` (`0x01..0x91`):
+$$\text{cipher}[0] = 1, \quad \text{cipher}[i] = \text{plain}[i] \oplus \text{Key}[(i - 1) \bmod 32] \quad (1 \le i \le 145)$$
+Finally, `sub_116790` Base64-encodes the 146-byte buffer into a **196-character string** (`executableFingerprint`).
 
 ---
 
 ## 3. What This Patch Fixes in `completeDiscordQuest`
 
 1. **WebCrypto `sub_a3990` / `sub_a4120` / `sub_1350` `executableFingerprint` Synthesis:**
-   - Synthesizes a valid 196-character Base64 `executableFingerprint` for every spoofed `PLAY_ON_DESKTOP` game (`version = 0x01`, `flags = 0x09` `is_signed | is_gui_window`, realistic 64–140 MB `file_size`, deterministic `first_64kb_sha256`, `spki_sha256`, `cert_sha256`, and harvested local `hw_sha256` block `[0x4A..0x71]`), XORed with `SHA-256(userId + "https://discord.com/careers")`.
+   - Synthesizes a valid 196-character Base64 `executableFingerprint` for every spoofed `PLAY_ON_DESKTOP` game (`version = 0x01` un-XORed at `[0x00]`, `flags = 0x03` `is_signed | is_pe64` at `[0x01]`, realistic 48–140 MB `file_size`, `time_date_stamp`, page-aligned `size_of_image`, deterministic `pe_headers_sha256`, harvested local `hw_sha256` block `[0x32..0x51]`, `sections_sha256`, and `cert_sha256`), XORing bytes `[1..145]` with `xor_key[(i - 1) & 31]`.
 2. **Full 22-Key `RunningGameStore` Schema & Non-Destructive Merging:**
    - Populates all 22 properties expected by `RunningGameStore` (`distributor`, `elevated`, `executableFingerprint`, `fullscreenType`, `gameMetadata`, `lastFocused`, `nativeProcessObserverId`, `origGameName`, `sandboxed`, `sku`, `windowHandle`, etc.) and merges spoofed games with real running games instead of wiping them out.
 3. **`launch_signature` 12-Bit Client-Mod Scrubber & `Error.prototype.stack` Sanitizer:**
