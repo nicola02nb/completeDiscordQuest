@@ -6,12 +6,12 @@
 
 import ErrorBoundary from "@components/ErrorBoundary";
 import definePlugin from "@utils/types";
-import { findByCodeLazy, findByPropsLazy } from "@webpack";
+import { filters, find, findByCodeLazy, findByPropsLazy, waitFor } from "@webpack";
 import { FluxDispatcher, RestAPI } from "@webpack/common";
 
 import { QuestButton, QuestsCount } from "./components/QuestButton";
 import settings from "./settings";
-import { ApplicationStreamingStore, ChannelStore, GuildChannelStore, QuestsStore, RunningGameStore, SuperPropertiesStore, UserStore } from "./stores";
+import { AdDeliveryStore, ChannelStore, GuildChannelStore, QuestsStore, RunningGameStore, SuperPropertiesStore, UserStore } from "./stores";
 
 const QuestApplyAction = findByCodeLazy("type:\"QUESTS_ENROLL_BEGIN\"") as (questId: string, action: QuestAction) => Promise<any>;
 const QuestClaimAction = findByCodeLazy("type:\"QUESTS_CLAIM_REWARD_BEGIN\"") as (questId: string, platform: number, location: number) => Promise<any>;
@@ -22,11 +22,14 @@ let acceptableQuests: QuestValue[] = [];
 let completableQuests: QuestValue[] = [];
 let claimableQuests: QuestValue[] = [];
 
-const completingQuest = new Map<string, boolean | "video" | "game">();
+const completingQuest = new Map<string, boolean | "video" | "game" | "activity">();
 const enrollingQuestIds = new Set<string>();
 const claimingQuestIds = new Set<string>();
 const failedClaimQuestIds = new Set<string>();
+const attemptedAchievementQuestIds = new Set<string>();
 let claimLoopRunning = false;
+let lastDecisionFetchAt = 0;
+const fetchedEarnedQuestIds = new Set<string>();
 const fakeGames = new Map<string, any>();
 const recentFakeGamesByPid = new Map<number, { game: any; expiresAt: number }>();
 const fakeApplications = new Map<string, any>();
@@ -45,6 +48,7 @@ function ensureToStringCloak() {
     toStringCloakInstalled = true;
     try {
         const origToString = Function.prototype.toString;
+        if (origToString.name === "toString" && hookedFunctions.has(origToString)) return;
         const cloakedToString = function (this: Function) {
             if (typeof this === "function" && hookedFunctions.has(this)) {
                 return hookedFunctions.get(this)!;
@@ -65,17 +69,20 @@ function ensureToStringCloak() {
     } catch {}
 }
 
-function cloakFunction<T extends Function>(fn: T, originalFn?: Function | null, fallbackName = ""): T {
+function cloakFunction<T extends Function>(fn: T, original?: Function | null, fallbackName = ""): T {
     ensureToStringCloak();
     try {
-        const name = originalFn?.name || fallbackName;
-        let nativeSource = originalFn
-            ? (hookedFunctions.get(originalFn) ?? Function.prototype.toString.call(originalFn))
-            : `function ${name}() { [native code] }`;
-        if (/Vencord|Vesktop|Equicord|BetterDiscord/i.test(nativeSource)) {
-            nativeSource = `function ${name}() { [native code] }`;
+        const targetName = original ? original.name : fallbackName;
+        const targetLength = original ? original.length : fn.length;
+        Object.defineProperty(fn, "name", { value: targetName, configurable: true });
+        Object.defineProperty(fn, "length", { value: targetLength, configurable: true });
+        let nativeStr = original
+            ? (hookedFunctions.get(original) ?? Function.prototype.toString.call(original))
+            : `function ${fallbackName}() { [native code] }`;
+        if (/Vencord|Vesktop|Equicord|BetterDiscord/i.test(nativeStr)) {
+            nativeStr = `function ${targetName || fallbackName}() { [native code] }`;
         }
-        hookedFunctions.set(fn, nativeSource);
+        hookedFunctions.set(fn, nativeStr);
     } catch {}
     return fn;
 }
@@ -194,102 +201,137 @@ function formatQuestExecutablePath(exePath: string | undefined | null): string |
     return exePath.toLowerCase().replace(/\\/g, "/").split("/").filter(Boolean).slice(-2).join("/");
 }
 
-const PUBLISHER_COMMON_NAMES: Array<{ match: RegExp; publisher: string; }> = [
-    { match: /counter-strike|cs2|dota|deadlock|team fortress|half-life|left 4 dead|portal|steam/i, publisher: "Valve Corp." },
-    { match: /path of exile|pathofexile|grinding gear/i, publisher: "Grinding Gear Games Limited" },
-    { match: /age of empires|reliccardinal|essenceeditor/i, publisher: "Relic Entertainment Inc." },
-    { match: /valorant|league of legends|riot|legends of runeterra|2xko/i, publisher: "Riot Games, Inc." },
-    { match: /fortnite|rocket league|fall guys|alan wake|epic games|unreal/i, publisher: "Epic Games Inc." },
-    { match: /overwatch|diablo|warcraft|hearthstone|starcraft|call of duty|battle\.net|blizzard/i, publisher: "Blizzard Entertainment, Inc." },
-    { match: /genshin|honkai|zenless|hoyoverse|mihoyo|cognosphere/i, publisher: "COGNOSPHERE PTE. LTD." },
-    { match: /apex legends|battlefield|ea sports|the sims|electronic arts|Respawn/i, publisher: "Electronic Arts, Inc." },
-    { match: /rainbow six|assassin's creed|far cry|the division|xdefiant|skull and bones|ubisoft/i, publisher: "Ubisoft Entertainment Sweden AB" },
-    { match: /destiny 2|marathon|bungie/i, publisher: "Bungie, Inc." },
-    { match: /warframe|soulframe|digital extremes/i, publisher: "Digital Extremes Ltd." },
-    { match: /pubg|krafton/i, publisher: "KRAFTON, Inc." },
-    { match: /marvel rivals|once human|naraka|netease/i, publisher: "NetEase Interactive Entertainment Pte. Ltd" },
-    { match: /delta force|arena breakout|honor of kings|nikke|proxima beta|level infinite|tencent/i, publisher: "Proxima Beta Pte. Limited" },
-    { match: /the finals|arc raiders|embark/i, publisher: "Embark Studios AB" },
-    { match: /helldivers|arrowhead|playstation|sony/i, publisher: "PlayStation PC LLC" },
-    { match: /halo|forza|minecraft|sea of thieves|flight simulator|xbox|microsoft/i, publisher: "Microsoft Corporation" },
-    { match: /cyberpunk|witcher|cd projekt/i, publisher: "CD PROJEKT S.A." },
-    { match: /baldur's gate|larian/i, publisher: "Larian Studios Games Ltd" },
-    { match: /street fighter|monster hunter|resident evil|dragon's dogma|capcom/i, publisher: "CAPCOM CO., LTD." },
-    { match: /elden ring|armored core|tekken|bandai namco/i, publisher: "Bandai Namco Entertainment Inc." },
-    { match: /final fantasy|square enix/i, publisher: "SQUARE ENIX CO., LTD." },
-    { match: /war thunder|enlisted|crossout|gaijin/i, publisher: "Gaijin Network Ltd" },
-    { match: /world of tanks|world of warships|wargaming/i, publisher: "Wargaming.net Limited" },
-    { match: /dead by daylight|behaviour/i, publisher: "Behaviour Interactive Inc." },
-    { match: /escape from tarkov|battlestate/i, publisher: "Battlestate Games Limited" },
-    { match: /roblox/i, publisher: "Roblox Corporation" },
-    { match: /VRChat/i, publisher: "VRChat Inc." },
-    { match: /rust|garry's mod|s&box|facepunch/i, publisher: "Facepunch Studios Ltd" },
-    { match: /palworld|pocketpair/i, publisher: "Pocketpair, Inc." },
-    { match: /wuthering waves|kuro games/i, publisher: "KURO GAMES LIMITED" },
-    { match: /throne and liberty|guild wars|ncsoft/i, publisher: "NCSOFT Corporation" },
-    { match: /lost ark|smilegate/i, publisher: "Smilegate RPG, Inc." },
-    { match: /black desert|crimson desert|pearl abyss/i, publisher: "Pearl Abyss Corp." },
-    { match: /the first descendant|maple|nexon/i, publisher: "NEXON Korea Corporation" },
+const KNOWN_PUBLISHERS: ReadonlyArray<[RegExp, string]> = [
+    [/counter-strike|cs2|dota|team fortress|deadlock|half-life|left 4 dead|portal|steam|valve/i, "Valve Corp."],
+    [/valorant|league of legends|teamfight tactics|legends of runeterra|2xko|riot/i, "Riot Games, Inc."],
+    [/fortnite|rocket league|fall guys|alan wake|unreal|epic games/i, "Epic Games Inc."],
+    [/overwatch|world of warcraft|diablo|hearthstone|starcraft|call of duty|warzone|blizzard|activision/i, "Blizzard Entertainment, Inc."],
+    [/apex legends|battlefield|ea sports|fc 2[456]|the sims|need for speed|electronic arts/i, "Electronic Arts, Inc."],
+    [/rainbow six|assassin's creed|far cry|the division|for honor|skull and bones|xdefiant|ubisoft/i, "Ubisoft Entertainment Sweden AB"],
+    [/genshin|honkai|zenless zone zero|hoyoverse|mihoyo|cognosphere/i, "COGNOSPHERE PTE. LTD."],
+    [/pubg|krafton/i, "KRAFTON, Inc."],
+    [/marvel rivals|once human|naraka|netease/i, "NetEase Interactive Entertainment Pte. Ltd."],
+    [/THE FINALS|arc raiders|embark/i, "Embark Studios AB"],
+    [/helldivers|arrowhead|playstation|sony/i, "PlayStation PC LLC"],
+    [/halo|forza|minecraft|sea of thieves|age of empires|flight simulator|xbox|microsoft|bethesda|doom|starfield|elder scrolls|fallout/i, "Microsoft Corporation"],
+    [/cyberpunk|witcher|cd projekt/i, "CD PROJEKT S.A."],
+    [/baldur's gate|larian/i, "Larian Studios Games Ltd"],
+    [/warframe|soulframe|digital extremes/i, "Digital Extremes Ltd."],
+    [/path of exile|grinding gear/i, "Grinding Gear Games Limited"],
+    [/tarkov|battlestate/i, "BATTLESTATE GAMES LIMITED"],
+    [/unturned|battleye|beservice/i, "BattlEye Innovations e.K."],
+    [/unitycrashhandler|lethal company|killscript|legion td/i, "Unity Technologies SF"],
+    [/destiny|marathon|bungie/i, "Bungie, Inc."],
+    [/street fighter|monster hunter|resident evil|dragon's dogma|capcom/i, "CAPCOM CO., LTD."],
+    [/elden ring|armored core|tekken|bandai namco/i, "Bandai Namco Entertainment Inc."],
+    [/final fantasy|square enix/i, "SQUARE ENIX CO., LTD."],
+    [/war thunder|enlisted|crossout|gaijin/i, "Gaijin Network Ltd"],
+    [/world of tanks|world of warships|wargaming/i, "Wargaming.net Limited"],
+    [/dead by daylight|behaviour/i, "Behaviour Interactive Inc."],
+    [/palworld|pocketpair/i, "Pocketpair, Inc."],
+    [/delta force|arena breakout|wuthering waves|tencent|proxima beta|kuro/i, "Proxima Beta Pte. Limited"],
+    [/roblox/i, "Roblox Corporation"],
+    [/discord/i, "Discord Inc."]
 ];
 
+function resolvePublisherCommonName(explicitPublisher?: string | null, appName?: string | null, exePath?: string | null): string {
+    if (explicitPublisher && typeof explicitPublisher === "string" && explicitPublisher.trim().length > 0) {
+        return explicitPublisher.trim();
+    }
+    const combined = `${appName || ""} ${exePath || ""}`.trim();
+    for (const [pattern, publisherCn] of KNOWN_PUBLISHERS) {
+        if (pattern.test(combined)) {
+            return publisherCn;
+        }
+    }
+    const cleanTitle = (appName || "")
+        .replace(/[^a-zA-Z0-9 ]+/g, " ")
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean)
+        .slice(0, 2)
+        .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+        .join(" ");
+    return cleanTitle ? `${cleanTitle} Interactive, Inc.` : "Valve Corp.";
+}
+
 const REAL_PUBLISHER_SPKI_SHA256: Record<string, string> = {
-    "Valve Corp.": "f0688b16a4be62cd296f2e2dfba20b238c1497fa9c2aa0a8fbba0ad9a3420a18",
-    "Grinding Gear Games Limited": "2d3d40abfa7983fa7a9f4b32fe12f383e9f4d987e423438986de4929795b77ff",
-    "Relic Entertainment Inc.": "e27baae8be28612b16e8b594ad689c71625d3cb3e1f19a8aa8aa395111b3b361",
-    "Discord Inc.": "0d0d1c0c5631ecab1e2fb4fa472e19b377a66509ad36c82114b33915a7cf426d",
+    "Valve Corp.": "371a0623e9c19d00bbb1e738b4733455dc76db156b54396d0ea258d3fcd0cbb2",
+    "Microsoft Corporation": "8d79b51d140a92816a138dcba36f41720b3ce5063718cfbc4ad77efde8315a4d",
+    "Epic Games Inc.": "2793b500911bdee5ff0ebdcb308122751a50bacd6dfecd462a2ff0d6f1d980eb",
+    "Epic Games, Inc.": "2793b500911bdee5ff0ebdcb308122751a50bacd6dfecd462a2ff0d6f1d980eb",
+    "Grinding Gear Games Limited": "4a7d34305a2f2d4d80468c26c2a577c12b7c0f75fa259831e437d2dca4db1e26",
+    "BATTLESTATE GAMES LIMITED": "9f2bb2c2b8be0d67edbd1d8ef7c1975b01b167240532992803a1db5d11630271",
+    "BattlEye Innovations e.K.": "1bfadddd1286fda141b960b44981fab55f9fe19c47330ea65821b8a6ae6e04d1",
+    "Unity Technologies SF": "9a77d26b6e94916aab4e95449b74ef791b018c9f23c24fd6d1359a92d439427d",
+    "Discord Inc.": "019f6eae63414925d0d85965c4f4af0eabec52dfb171c39d253ba5f19498c095",
 };
 
 const REAL_PE_PROFILES: Record<string, {
-    flags: number;
-    fileSize: number;
+    publisherCn: string;
+    fileSize: bigint;
     timeDateStamp: number;
     sizeOfImage: number;
-    peHeadersSha256: string;
-    sectionsSha256: string;
-    certSha256: string;
+    hdrSha256: string;
+    secSha256: string;
 }> = {
     "win64/cs2.exe": {
-        flags: 0x03,
-        fileSize: 2964288,
-        timeDateStamp: 0x695eb999,
-        sizeOfImage: 0x2c6000,
-        peHeadersSha256: "2fb0fd58b4e38c254fa74a9aa139398a0ed8496dd29b97fb95e8b76deae84fd4",
-        sectionsSha256: "789919401f2d0f7bb99f8961c80c4f8f53f3c8e63580865d03771770dd640fd5",
-        certSha256: "f63961a9e745efeb6b974d809c6cb221a724cf8e8e9d6c0166ab63a2a1da2da4",
+        publisherCn: "Valve Corp.",
+        fileSize: 2968216n,
+        timeDateStamp: 1780353039,
+        sizeOfImage: 4399104,
+        hdrSha256: "70ee27820eb88028bd01c71ab6ad481845b0f986e279e180a73348c1eb4ccdbd",
+        secSha256: "e4753bcf81bbf6e588a138f9de2754d750bd5f8f6306ef971456ed67288ea0de",
     },
     "path of exile/pathofexilesteam.exe": {
-        flags: 0x03,
-        fileSize: 43836104,
-        timeDateStamp: 0x69debee3,
-        sizeOfImage: 0x2bd6000,
-        peHeadersSha256: "3d8410c237deae1b8008819e49e13ba154be821258e9369f2f98f4a79ddbe251",
-        sectionsSha256: "efaa5a09d9d5f95748981b68443484f3993cf21536eb242f669051215cbcb5d2",
-        certSha256: "16bb0b974347dd4680ff91ef2d50f242c44d8f5d323e968f609aa606024ef095",
+        publisherCn: "Grinding Gear Games Limited",
+        fileSize: 79345496n,
+        timeDateStamp: 1788480744,
+        sizeOfImage: 81326080,
+        hdrSha256: "701cd4cc5340283e472bb3bb8c533c93437e63d2e416720d82fcb7606d915df1",
+        secSha256: "8587c9700969c5d30caf6fd7dda44975f252a6a8a055d07b1a6e563bacab9a2d",
     },
     "arena/escapefromtarkovarena.exe": {
-        flags: 0x03,
-        fileSize: 3241984,
-        timeDateStamp: 0x67b4340e,
-        sizeOfImage: 0x329000,
-        peHeadersSha256: "8d36f6659761c5c7e6281c2b105c028a0d5bc75d83c63718d2cf9e6564331d73",
-        sectionsSha256: "bb069f904c9c33c84c9d3dc35bd8e2caef6f42716257113b726526fb01fa50fb",
-        certSha256: "0000000000000000000000000000000000000000000000000000000000000000",
+        publisherCn: "BATTLESTATE GAMES LIMITED",
+        fileSize: 3243360n,
+        timeDateStamp: 1778746394,
+        sizeOfImage: 684032,
+        hdrSha256: "e809d7e33272567b5d2525f324cf5bd33555471e080b46df8c58d26590e21883",
+        secSha256: "c602de1c1277db5de20b3753cd0074071fedc69bdca6f5f0a4b8b1661d3d7d9b",
+    },
+    "age of empires iv/gpuburner.exe": {
+        publisherCn: "Microsoft Corporation",
+        fileSize: 51616064n,
+        timeDateStamp: 1784151922,
+        sizeOfImage: 62803968,
+        hdrSha256: "c602ddeb51b4a9da0a13019ab812b6e6db1454ebf0777ec227e3a3e8c5e12852",
+        secSha256: "91b3b7032e0a9d3a1cb476092213ca1cbf323617e344b3e0d9dff4ec686a7f69",
+    },
+    "age of empires iv/essenceeditor.exe": {
+        publisherCn: "Microsoft Corporation",
+        fileSize: 10231608n,
+        timeDateStamp: 3813183688,
+        sizeOfImage: 10231808,
+        hdrSha256: "a25ba2a7621664f67ea7f861471098150dea3e874ff2f5fa875d2d3708cdf925",
+        secSha256: "52b2292823de3571a3d64eba977f923a30e7bd16b9b003c6beec694a2c4778e2",
+    },
+    "win64/vconsole2.exe": {
+        publisherCn: "Valve Corp.",
+        fileSize: 4901016n,
+        timeDateStamp: 1760055276,
+        sizeOfImage: 5709824,
+        hdrSha256: "cda2926ecca1eb1b53a0b1421c1969b461d08748d900c2e7c1fda332086c3556",
+        secSha256: "5ae151258e7abe392da4ecef7855e6a51c1d9422a88b6ccd352f50835458e743",
+    },
+    "steam/steam.exe": {
+        publisherCn: "Valve Corp.",
+        fileSize: 5823128n,
+        timeDateStamp: 1792617103,
+        sizeOfImage: 7430144,
+        hdrSha256: "e8bcb8fce00b9a29b1d5fca5e01607cdd06ba30329bc605994dced5d0741c196",
+        secSha256: "476550e4d464edbaf9bdd27f609247f699e72e8db60b37fbf5b72f192b06062b",
     },
 };
-
-function resolvePublisherCommonName(appName?: string | null, exePath?: string | null): string {
-    const combined = `${appName ?? ""} ${exePath ?? ""}`;
-    for (const entry of PUBLISHER_COMMON_NAMES) {
-        if (entry.match.test(combined)) {
-            return entry.publisher;
-        }
-    }
-    if (appName && appName.trim()) {
-        const clean = appName.replace(/[™®©]/g, "").trim();
-        return `${clean} Studios Inc.`;
-    }
-    return "Epic Games Inc.";
-}
 
 function hexToBytes32(hex: string): Uint8Array {
     const out = new Uint8Array(32);
@@ -307,7 +349,11 @@ async function synthesizeSignedExecutableFingerprint(
     realGames: any[] = [],
     appName?: string
 ): Promise<string> {
-    const publisher = resolvePublisherCommonName(appName, exePath);
+    const formattedPath = formatQuestExecutablePath(exePath) ?? exePath.toLowerCase();
+    const realProfile = REAL_PE_PROFILES[formattedPath];
+    const publisher = realProfile
+        ? realProfile.publisherCn
+        : resolvePublisherCommonName(null, appName, exePath);
     try {
         const nativeHelper = (VencordNative as any)?.pluginHelpers?.DiscordStealthGuard;
         if (nativeHelper?.generateExecutableFingerprint && userId) {
@@ -329,38 +375,39 @@ async function synthesizeSignedExecutableFingerprint(
             ...realGames,
             ...(RunningGameStore?.getCandidateGames?.() ?? [])
         ];
-        for (const cand of candidates) {
-            const existingFp = cand?.executableFingerprint || cand?.exeFingerprint;
+        for (const g of candidates) {
+            const existingFp = g?.executableFingerprint || g?.exeFingerprint;
             if (typeof existingFp !== "string" || existingFp.length !== 196) continue;
-            const raw = Uint8Array.from(atob(existingFp), c => c.charCodeAt(0));
-            if (raw.length === 0x92 && raw[0] === 0x01) {
-                const plain = new Uint8Array(0x92);
-                plain[0] = raw[0];
-                for (let i = 1; i < 0x92; i++) plain[i] = raw[i] ^ xorKey[(i - 1) & 31];
-                const plainView = new DataView(plain.buffer);
-                const flags = plain[1];
-                const fileSizeLow = plainView.getUint32(0x02, true);
-                const fileSizeHigh = plainView.getUint32(0x06, true);
-                const tds = plainView.getUint32(0x0A, true);
-                const imgSize = plainView.getUint32(0x0E, true);
-                if ((flags & 0x01) !== 0 && (flags & 0xFC) === 0
-                    && fileSizeHigh === 0 && fileSizeLow >= 4096
-                    && tds >= 0x386D4380 && tds <= 0x7FFFFFFF
-                    && imgSize >= 0x1000 && (imgSize & 0xFFF) === 0) {
-                    harvestedHw = plain.slice(0x32, 0x52);
-                    break;
+            try {
+                const raw = Uint8Array.from(atob(existingFp), c => c.charCodeAt(0));
+                if (raw.length === 0x92 && raw[0] === 0x01) {
+                    const plain = new Uint8Array(0x92);
+                    plain[0] = raw[0];
+                    for (let i = 1; i < 0x92; i++) plain[i] = raw[i] ^ xorKey[(i - 1) & 31];
+                    const flags = plain[1];
+                    const dv = new DataView(plain.buffer);
+                    const fileSizeLow = dv.getUint32(0x02, true);
+                    const fileSizeHigh = dv.getUint32(0x06, true);
+                    const tds = dv.getUint32(0x0A, true);
+                    const sizeOfImage = dv.getUint32(0x0E, true);
+                    const validFlags = (flags & 0xFC) === 0 && (flags & 0x01) !== 0;
+                    const validFileSize = fileSizeHigh === 0 && fileSizeLow >= 1024;
+                    const validTds = tds >= 0x40000000 && tds <= 0x80000000;
+                    const validImage = sizeOfImage >= 0x1000 && (sizeOfImage & 0xFFF) === 0;
+                    if (validFlags && validFileSize && validTds && validImage) {
+                        harvestedHw = plain.slice(0x32, 0x52);
+                        break;
+                    }
                 }
-            }
+            } catch {}
         }
     } catch {}
 
-    const formattedPath = formatQuestExecutablePath(exePath) ?? exePath.toLowerCase();
-    const realProfile = REAL_PE_PROFILES[formattedPath];
     const hHw = await sha256("hw:" + navigator.userAgent + ":" + (navigator.hardwareConcurrency || 8) + ":" + String(userId ?? ""));
-
     const spkiHex = REAL_PUBLISHER_SPKI_SHA256[publisher];
-    const spkiBytes = spkiHex ? hexToBytes32(spkiHex) : await sha256(`SPKI_DER_V1:${publisher}`);
-    const pubBytes = enc.encode(publisher);
+    const spkiBytes = spkiHex ? hexToBytes32(spkiHex) : await sha256(`AUTHENTICODE_SPKI_RSA4096:${publisher}`);
+    const certRawCn = publisher === "Epic Games, Inc." ? "Epic Games Inc." : publisher;
+    const pubBytes = enc.encode(certRawCn);
     const certInput = new Uint8Array(pubBytes.length + 32);
     certInput.set(pubBytes, 0);
     certInput.set(spkiBytes, pubBytes.length);
@@ -369,17 +416,16 @@ async function synthesizeSignedExecutableFingerprint(
     const buf = new Uint8Array(0x92);
     const pktView = new DataView(buf.buffer);
     buf[0x00] = 0x01; // Version = 1 (un-XORed in sub_1350)
+    buf[0x01] = 0x03; // Flags = is_signed (0x01) | is_pe64 (0x02)
 
     if (realProfile) {
-        buf[0x01] = realProfile.flags | 0x01;
-        pktView.setBigUint64(0x02, BigInt(realProfile.fileSize), true);
+        pktView.setBigUint64(0x02, realProfile.fileSize, true);
         pktView.setUint32(0x0A, realProfile.timeDateStamp >>> 0, true);
         pktView.setUint32(0x0E, realProfile.sizeOfImage >>> 0, true);
-        buf.set(hexToBytes32(realProfile.peHeadersSha256), 0x12);
+        buf.set(hexToBytes32(realProfile.hdrSha256), 0x12);
         buf.set(harvestedHw && harvestedHw.length === 32 ? harvestedHw : hHw, 0x32);
-        buf.set(hexToBytes32(realProfile.sectionsSha256), 0x52);
-        const profileCert = /^0+$/.test(realProfile.certSha256) ? hCert : hexToBytes32(realProfile.certSha256);
-        buf.set(profileCert, 0x72);
+        buf.set(hexToBytes32(realProfile.secSha256), 0x52);
+        buf.set(hCert, 0x72);
     } else {
         const seed = `${appId}:${formattedPath}:${publisher}`;
         const seedHash = await sha256("seed:" + seed);
@@ -395,7 +441,6 @@ async function synthesizeSignedExecutableFingerprint(
         const hPeHeaders = await sha256(`PE_HEADERS_V1:${seed}:${timeDateStamp}:${sizeOfImage}`);
         const hSections = await sha256(`PE_SECTIONS_V1:${seed}:${sizeOfImage}`);
 
-        buf[0x01] = 0x03; // Flags = is_signed (0x01) | is_pe64 (0x02)
         pktView.setBigUint64(0x02, fileSize, true);
         pktView.setUint32(0x0A, timeDateStamp, true);
         pktView.setUint32(0x0E, sizeOfImage, true);
@@ -411,6 +456,143 @@ async function synthesizeSignedExecutableFingerprint(
     let binary = "";
     for (let i = 0; i < out.length; i++) binary += String.fromCharCode(out[i]);
     return btoa(binary);
+}
+
+async function ensureSealedQuestMetadata(questId?: string): Promise<void> {
+    try {
+        const now = Date.now();
+        const quest = questId ? (QuestsStore?.getQuest?.(questId) ?? QuestsStore?.quests?.get?.(questId)) : null;
+        const adMap = AdDeliveryStore?.deliveryAdDecisionByPlacement;
+        const hasDecisionSealed = Boolean(adMap?.get?.(1)?.metadataSealed || adMap?.get?.(3)?.metadataSealed);
+        const hasQuestTrafficSealed = !questId || Boolean((quest as any)?.trafficMetadataSealed || (quest as any)?.traffic_metadata_sealed);
+
+        if (hasDecisionSealed && hasQuestTrafficSealed) {
+            return;
+        }
+
+        const promises: Promise<any>[] = [];
+
+        if (now - lastDecisionFetchAt > 60_000) {
+            lastDecisionFetchAt = now;
+            if (!QuestsStore?.quests || QuestsStore?.quests?.size === 0 || !hasQuestTrafficSealed) {
+                const fetchCurrentQuests = find(filters.byCode("QUESTS_FETCH_CURRENT_QUESTS_BEGIN"), { isIndirect: true });
+                if (typeof fetchCurrentQuests === "function") {
+                    promises.push(Promise.resolve(fetchCurrentQuests()).catch(() => null));
+                }
+            }
+            if (!hasDecisionSealed) {
+                const fetchQuestToDeliver = find(filters.byCode("QUESTS_FETCH_QUEST_TO_DELIVER_BEGIN"), { isIndirect: true });
+                if (typeof fetchQuestToDeliver === "function") {
+                    promises.push(Promise.resolve(fetchQuestToDeliver(1, "questBar-open")).catch(() => null));
+                }
+                const fetchQuestHomeHero = find(filters.byCode("QUESTS_FETCH_QUEST_HOME_HERO_BEGIN"), { isIndirect: true });
+                if (typeof fetchQuestHomeHero === "function") {
+                    promises.push(Promise.resolve(fetchQuestHomeHero()).catch(() => null));
+                }
+            }
+        }
+
+        if (questId && !hasQuestTrafficSealed && !fetchedEarnedQuestIds.has(questId)) {
+            fetchedEarnedQuestIds.add(questId);
+            const fetchEarnedQuestToDeliver = find(filters.byCode("QUESTS_FETCH_EARNED_QUEST_TO_DELIVER_BEGIN"), { isIndirect: true });
+            if (typeof fetchEarnedQuestToDeliver === "function") {
+                promises.push(Promise.resolve(fetchEarnedQuestToDeliver([questId], 10, "quest_bar")).catch(() => null));
+            }
+        }
+
+        if (promises.length > 0) {
+            await Promise.allSettled(promises);
+        }
+    } catch {}
+}
+
+function installQuestRestInterceptor() {
+    try {
+        if (!RestAPI || typeof RestAPI.post !== "function" || isStealthHooked(RestAPI.post)) return;
+        const rawPost = RestAPI.post;
+        const origPost = rawPost.bind(RestAPI);
+        const wrappedPost = cloakFunction(async function (req: any, ...rest: any[]) {
+            try {
+                const url = typeof req === "string" ? req : req?.url;
+                if (typeof url === "string" && url.includes("/quests/")) {
+                    const body = req?.body;
+                    if (body && typeof body === "object") {
+                        const hbMatch = url.match(/\/quests\/([^/]+)\/heartbeat/);
+                        if (hbMatch && !body.stream_key && !(body.terminal === true && !body.executable_path)) {
+                            const questId = hbMatch[1];
+                            const fake = fakeGames.get(questId);
+                            if (fake) {
+                                if (!body.executable_path) {
+                                    body.executable_path = formatQuestExecutablePath(fake.exePath);
+                                } else {
+                                    body.executable_path = formatQuestExecutablePath(body.executable_path);
+                                }
+                                if (!body.executable_fingerprint && fake.executableFingerprint) {
+                                    body.executable_fingerprint = fake.executableFingerprint;
+                                }
+                            } else if (body.executable_path) {
+                                body.executable_path = formatQuestExecutablePath(body.executable_path);
+                            }
+                        }
+
+                        const enrollOrClaim = url.match(/\/quests\/([^/]+)\/(?:enroll|claim-reward)/);
+                        if (enrollOrClaim) {
+                            const questId = enrollOrClaim[1];
+                            if (body.metadata_sealed == null || body.traffic_metadata_sealed == null) {
+                                await ensureSealedQuestMetadata(questId);
+                            }
+                            const q = (QuestsStore?.getQuest?.(questId) ?? QuestsStore?.quests?.get?.(questId)) as any;
+                            const adMap = AdDeliveryStore?.deliveryAdDecisionByPlacement;
+                            const adDecision1 = adMap?.get?.(1);
+                            const adDecision3 = adMap?.get?.(3);
+
+                            if (body.metadata_sealed == null) {
+                                const sealed =
+                                    q?.metadataSealed ||
+                                    q?.metadata_sealed ||
+                                    q?.config?.metadataSealed ||
+                                    adDecision1?.metadataSealed ||
+                                    adDecision3?.metadataSealed;
+                                if (sealed) body.metadata_sealed = sealed;
+                            }
+                            if (body.traffic_metadata_sealed == null) {
+                                const trafficSealed =
+                                    q?.trafficMetadataSealed ||
+                                    q?.traffic_metadata_sealed ||
+                                    q?.config?.trafficMetadataSealed ||
+                                    adDecision1?.trafficMetadataSealed ||
+                                    adDecision3?.trafficMetadataSealed;
+                                if (trafficSealed) body.traffic_metadata_sealed = trafficSealed;
+                            }
+                        }
+                    }
+                }
+            } catch {}
+            return origPost(req, ...rest);
+        }, rawPost, "post");
+        RestAPI.post = wrappedPost;
+        storeCleanupCallbacks.push(() => {
+            RestAPI.post = rawPost;
+        });
+    } catch {}
+}
+
+function resolvePreferredRewardPlatform(platforms: number[] | undefined | null, prioritySetting?: string): number | null {
+    if (!Array.isArray(platforms) || platforms.length === 0) return 0;
+    if (platforms.length === 1) return platforms[0];
+    if (prioritySetting === "manual") return null;
+
+    const priorityOrder = String(prioritySetting || "4,2,1,3,0")
+        .split(",")
+        .map(s => Number(s.trim()))
+        .filter(n => !Number.isNaN(n));
+
+    for (const pref of priorityOrder) {
+        if (platforms.includes(pref)) {
+            return pref;
+        }
+    }
+    return platforms[0];
 }
 
 const CONSENT_WARNING = [
@@ -456,53 +638,59 @@ export default definePlugin({
         {
             find: "extendSuperProperties({launch_signature:",
             replacement: {
-                match: /launch_signature:(\i)/g,
+                match: /launch_signature:(\i)(?!\.)/g,
                 replace: "launch_signature:$self.scrubLaunchSignature($1)"
             }
         }
     ],
     installRuntimeStoreHooks() {
         const self = this;
-        try {
-            if (RunningGameStore) {
-                const rawGetGames = RunningGameStore.getRunningGames;
+        waitFor(["getRunningGames", "getGameForPID"], (store: any) => {
+            try {
+                const rawGetGames = store.getRunningGames;
                 if (typeof rawGetGames === "function") {
-                    const boundGetGames = rawGetGames.bind(RunningGameStore);
-                    RunningGameStore.getRunningGames = cloakFunction(function () {
+                    const boundGetGames = rawGetGames.bind(store);
+                    store.getRunningGames = cloakFunction(function () {
                         return self.getRunningGames(boundGetGames());
                     }, rawGetGames, "getRunningGames");
                     storeCleanupCallbacks.push(() => {
-                        RunningGameStore.getRunningGames = rawGetGames;
+                        store.getRunningGames = rawGetGames;
                     });
                 }
-                const rawGetPid = RunningGameStore.getGameForPID;
+                const rawGetPid = store.getGameForPID;
                 if (typeof rawGetPid === "function") {
-                    const boundGetPid = rawGetPid.bind(RunningGameStore);
-                    RunningGameStore.getGameForPID = cloakFunction(function (pid: number) {
+                    const boundGetPid = rawGetPid.bind(store);
+                    store.getGameForPID = cloakFunction(function (pid: number) {
                         return self.getGameForPID(pid) ?? boundGetPid(pid);
                     }, rawGetPid, "getGameForPID");
                     storeCleanupCallbacks.push(() => {
-                        RunningGameStore.getGameForPID = rawGetPid;
+                        store.getGameForPID = rawGetPid;
                     });
                 }
+            } catch (err) {
+                console.warn("[CompleteDiscordQuest] Failed to hook RunningGameStore:", err);
             }
-            if (ApplicationStreamingStore) {
-                const rawGetStream = ApplicationStreamingStore.getStreamerActiveStreamMetadata;
+        });
+        waitFor("getStreamerActiveStreamMetadata", (store: any) => {
+            try {
+                const rawGetStream = store.getStreamerActiveStreamMetadata;
                 if (typeof rawGetStream === "function") {
-                    const boundGetStream = rawGetStream.bind(ApplicationStreamingStore);
-                    ApplicationStreamingStore.getStreamerActiveStreamMetadata = cloakFunction(function () {
+                    const boundGetStream = rawGetStream.bind(store);
+                    store.getStreamerActiveStreamMetadata = cloakFunction(function () {
                         return self.getStreamerActiveStreamMetadata() ?? boundGetStream();
                     }, rawGetStream, "getStreamerActiveStreamMetadata");
                     storeCleanupCallbacks.push(() => {
-                        ApplicationStreamingStore.getStreamerActiveStreamMetadata = rawGetStream;
+                        store.getStreamerActiveStreamMetadata = rawGetStream;
                     });
                 }
+            } catch (err) {
+                console.warn("[CompleteDiscordQuest] Failed to hook ApplicationStreamingStore:", err);
             }
-        } catch (err) {
-            console.warn("[CompleteDiscordQuest] Failed to install runtime store hooks:", err);
-        }
+        });
+        installQuestRestInterceptor();
     },
     start() {
+        if ((window as any).__OVERLAY__) return;
         if (!ensureHasAcceptedToUsePlugin()) {
             stopAllFarming();
             return;
@@ -511,16 +699,29 @@ export default definePlugin({
         installStackTraceSanitizer();
         scrubCachedSuperProperties();
         this.installRuntimeStoreHooks();
-        QuestsStore.addChangeListener(updateQuests);
-        updateQuests();
+        waitFor(["getQuest", "quests"], (store: any) => {
+            try {
+                store.addChangeListener?.(updateQuests);
+                storeCleanupCallbacks.push(() => {
+                    try {
+                        store.removeChangeListener?.(updateQuests);
+                    } catch { }
+                });
+                ensureSealedQuestMetadata().finally(() => {
+                    updateQuests();
+                });
+            } catch { }
+        });
     },
     stop() {
-        QuestsStore.removeChangeListener(updateQuests);
+        try {
+            QuestsStore?.removeChangeListener?.(updateQuests);
+        } catch { }
         stopAllFarming();
         while (storeCleanupCallbacks.length > 0) {
             try {
                 storeCleanupCallbacks.pop()?.();
-            } catch {}
+            } catch { }
         }
         if (restoreStackGetter) {
             restoreStackGetter();
@@ -610,6 +811,16 @@ export default definePlugin({
     }
 });
 
+const SUPPORTED_TASK_NAMES = [
+    "WATCH_VIDEO",
+    "WATCH_VIDEO_ON_MOBILE",
+    "PLAY_ON_DESKTOP",
+    "STREAM_ON_DESKTOP",
+    "PLAY_ACTIVITY",
+    "ACHIEVEMENT_IN_ACTIVITY",
+    "ACHIEVEMENT_IN_GAME"
+] as const;
+
 function isQuestEligibleForFarming(quest: QuestValue): boolean {
     try {
         const questConfig = quest?.config?.taskConfig || quest?.config?.taskConfigV2;
@@ -619,7 +830,8 @@ function isQuestEligibleForFarming(quest: QuestValue): boolean {
                 || taskName === "WATCH_VIDEO_ON_MOBILE" && settings.store.farmVideos
                 || taskName === "PLAY_ON_DESKTOP" && settings.store.farmPlayOnDesktop
                 || taskName === "STREAM_ON_DESKTOP" && settings.store.farmStreamOnDesktop
-                || taskName === "PLAY_ACTIVITY" && settings.store.farmPlayActivity);
+                || taskName === "PLAY_ACTIVITY" && settings.store.farmPlayActivity
+                || (taskName === "ACHIEVEMENT_IN_ACTIVITY" || taskName === "ACHIEVEMENT_IN_GAME") && (settings.store.farmAchievementInActivity ?? true));
         })) return false;
 
         const rewards = quest?.config?.rewardsConfig?.rewards || [];
@@ -685,17 +897,24 @@ function updateQuests() {
         const activeValues = [...completingQuest.values()];
         let hasActiveVideo = activeValues.includes("video");
         let hasActiveGame = activeValues.includes("game");
+        let hasActiveActivity = activeValues.includes("activity");
 
         for (const quest of completableQuests) {
             if (!quest?.id || completingQuest.has(quest.id)) continue;
+            if (!isQuestEligibleForFarming(quest)) continue;
             const tc = quest.config?.taskConfig ?? quest.config?.taskConfigV2;
             if (!tc?.tasks) continue;
-            const tName = ["WATCH_VIDEO", "PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP", "PLAY_ACTIVITY", "WATCH_VIDEO_ON_MOBILE"].find(x => tc.tasks[x] != null);
+            const tName = SUPPORTED_TASK_NAMES.find(x => (tc.tasks as any)[x] != null);
             if (!tName) continue;
             const isVideo = tName === "WATCH_VIDEO" || tName === "WATCH_VIDEO_ON_MOBILE";
+            const isAchievement = tName === "ACHIEVEMENT_IN_ACTIVITY" || tName === "ACHIEVEMENT_IN_GAME";
             if (isVideo) {
                 if (hasActiveVideo) continue;
                 hasActiveVideo = true;
+                completeQuest(quest);
+            } else if (isAchievement) {
+                if (hasActiveActivity || attemptedAchievementQuestIds.has(quest.id)) continue;
+                hasActiveActivity = true;
                 completeQuest(quest);
             } else {
                 if (hasActiveGame) continue;
@@ -708,15 +927,21 @@ function updateQuests() {
     }
 }
 
-function acceptQuest(quest: QuestValue) {
+async function acceptQuest(quest: QuestValue) {
     if (!settings.store.acceptQuestsAutomatically || !quest?.id || enrollingQuestIds.has(quest.id)) return;
     try {
         enrollingQuestIds.add(quest.id);
         const questName = quest?.config?.messages?.questName ?? quest.id;
+        const tc = quest?.config?.taskConfig ?? quest?.config?.taskConfigV2;
+        const tasks = (tc?.tasks ?? {}) as Record<string, any>;
+        const isActivityQuest = Boolean(tasks.PLAY_ACTIVITY || tasks.ACHIEVEMENT_IN_ACTIVITY || tasks.ACHIEVEMENT_IN_GAME);
         console.log("Accepting quest:", questName);
+
+        await ensureSealedQuestMetadata(quest.id);
+
         const action: QuestAction = {
             questContent: QuestLocationMap?.QUEST_HOME_DESKTOP ?? 11,
-            questContentCTA: "ACCEPT_QUEST",
+            questContentCTA: isActivityQuest ? "START_QUEST" : "ACCEPT_QUEST",
             sourceQuestContent: 0,
         };
         QuestApplyAction(quest.id, action).then(() => {
@@ -749,18 +974,19 @@ async function processClaimQueue() {
             const questId = nextQuest.id;
             const questName = nextQuest.config?.messages?.questName ?? questId;
             const platforms = nextQuest.config?.rewardsConfig?.platforms;
-            if (Array.isArray(platforms) && platforms.length > 1) {
+            const platform = resolvePreferredRewardPlatform(platforms, settings.store.rewardPlatformPriority);
+            if (platform === null) {
                 failedClaimQuestIds.add(questId);
-                console.log(`[CompleteDiscordQuest] Skipping auto-claim for ${questName} (requires manual platform choice).`);
+                console.log(`[CompleteDiscordQuest] Skipping auto-claim for ${questName} (rewardPlatformPriority is set to manual).`);
                 continue;
             }
-            const platform = Array.isArray(platforms) && platforms.length === 1 ? platforms[0] : 0;
             const location = QuestLocationMap?.QUEST_HOME_DESKTOP ?? 11;
 
             claimingQuestIds.add(questId);
             let abortQueueOnCaptcha = false;
             try {
-                console.log("[CompleteDiscordQuest] Claiming completed quest reward:", questName);
+                await ensureSealedQuestMetadata(questId);
+                console.log(`[CompleteDiscordQuest] Claiming completed quest reward: ${questName} (platform=${platform})`);
                 if (typeof QuestClaimAction === "function") {
                     const res = await QuestClaimAction(questId, platform, location);
                     if (res?.errors?.length > 0 || res?.body?.captcha_key) {
@@ -776,6 +1002,7 @@ async function processClaimQueue() {
                     });
                 }
             } catch (claimErr: any) {
+                // Do not retry quests that require interactive Captcha or return 4xx
                 failedClaimQuestIds.add(questId);
                 console.warn("[CompleteDiscordQuest] Auto-claim skipped/deferred to manual UI for:", questName, claimErr);
                 if (claimErr?.status === 400 || claimErr?.status === 403 || claimErr?.body?.captcha_key || /captcha/i.test(String(claimErr?.message || claimErr))) {
@@ -788,6 +1015,7 @@ async function processClaimQueue() {
                 break;
             }
 
+            // Human-like 5..8s spacing between reward claims
             const delayMs = 5000 + Math.floor(Math.random() * 3000);
             await new Promise(resolve => setTimeout(resolve, delayMs));
         }
@@ -853,17 +1081,17 @@ function completeQuest(quest: QuestValue) {
             completingQuest.set(quest.id, false);
             return;
         }
-        const taskName = ["WATCH_VIDEO", "PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP", "PLAY_ACTIVITY", "WATCH_VIDEO_ON_MOBILE"].find(x => taskConfig.tasks[x] != null);
+        const taskName = SUPPORTED_TASK_NAMES.find(x => (taskConfig.tasks as any)[x] != null);
         if (!taskName) {
             console.log("Unknown task type for quest:", questName);
             completingQuest.set(quest.id, false);
             return;
         }
-        const taskData = taskConfig.tasks[taskName] as any;
-        const applicationId = quest.config?.application?.id ?? taskData?.applications?.[0]?.id;
+        const taskData = (taskConfig.tasks as any)[taskName] as any;
+        const applicationId = taskData?.applications?.[0]?.id ?? quest.config?.application?.id;
         const applicationName = quest.config?.application?.name ?? quest.config?.messages?.gameTitle ?? questName;
-        const secondsNeeded = taskData?.target ?? 0;
-        let secondsDone = quest.userStatus?.progress?.[taskName]?.value ?? 0;
+        const secondsNeeded = taskData?.target ?? 1;
+        let secondsDone = (quest.userStatus?.progress as any)?.[taskName]?.value ?? 0;
 
         if (!isApp && taskName !== "WATCH_VIDEO" && taskName !== "WATCH_VIDEO_ON_MOBILE") {
             console.log("This no longer works in browser for non-video quests (" + taskName + "). Use the discord desktop app to complete the", questName, "quest!");
@@ -872,9 +1100,10 @@ function completeQuest(quest: QuestValue) {
         }
 
         const isVideoTask = taskName === "WATCH_VIDEO" || taskName === "WATCH_VIDEO_ON_MOBILE";
-        completingQuest.set(quest.id, isVideoTask ? "video" : "game");
+        const isAchievementTask = taskName === "ACHIEVEMENT_IN_ACTIVITY" || taskName === "ACHIEVEMENT_IN_GAME";
+        completingQuest.set(quest.id, isVideoTask ? "video" : (isAchievementTask ? "activity" : "game"));
 
-        console.log(`Completing quest ${questName} (${quest.id}) - ${taskName} for ${secondsNeeded} seconds.`);
+        console.log(`Completing quest ${questName} (${quest.id}) - ${taskName} for ${secondsNeeded} target.`);
 
         switch (taskName) {
             case "WATCH_VIDEO":
@@ -941,6 +1170,8 @@ function completeQuest(quest: QuestValue) {
                             }
                         }
                         console.log("Quest completed:", questName);
+                        // Transition from "video" to `true` so the next video quest in the queue can start,
+                        // while preventing this quest from being re-triggered before QuestsStore updates.
                         completingQuest.set(quest.id, true);
                         setTimeout(() => {
                             if (!quest.userStatus?.completedAt) {
@@ -1033,6 +1264,15 @@ function completeQuest(quest: QuestValue) {
 
                                     if (progress >= secondsNeeded) {
                                         console.log("Quest completed!");
+                                        completingQuest.set(quest.id, true);
+                                        setTimeout(() => {
+                                            if (!quest.userStatus?.completedAt) {
+                                                completingQuest.set(quest.id, false);
+                                            }
+                                            updateQuests();
+                                        }, 10000);
+                                        setTimeout(updateQuests, 2000);
+                                    } else {
                                         completingQuest.set(quest.id, false);
                                     }
                                 }
@@ -1082,6 +1322,15 @@ function completeQuest(quest: QuestValue) {
 
                             if (progress >= secondsNeeded) {
                                 console.log("Quest completed!");
+                                completingQuest.set(quest.id, true);
+                                setTimeout(() => {
+                                    if (!quest.userStatus?.completedAt) {
+                                        completingQuest.set(quest.id, false);
+                                    }
+                                    updateQuests();
+                                }, 10000);
+                                setTimeout(updateQuests, 2000);
+                            } else {
                                 completingQuest.set(quest.id, false);
                             }
                         }
@@ -1097,22 +1346,49 @@ function completeQuest(quest: QuestValue) {
                 break;
             }
 
-            case "PLAY_ACTIVITY": {
+            case "PLAY_ACTIVITY":
+            case "ACHIEVEMENT_IN_ACTIVITY":
+            case "ACHIEVEMENT_IN_GAME": {
                 const channelId = ChannelStore?.getSortedPrivateChannels?.()?.[0]?.id
-                    ?? (Object.values(GuildChannelStore?.getAllGuilds?.() ?? {}) as any[]).find(x => x != null && Array.isArray(x.VOCAL) && x.VOCAL.length > 0)?.VOCAL?.[0]?.channel?.id;
-                const streamKey = channelId ? `call:${channelId}:1` : undefined;
+                    ?? (Object.values(GuildChannelStore?.getAllGuilds?.() ?? {}) as any[]).find(x => x != null && Array.isArray(x.VOCAL) && x.VOCAL.length > 0)?.VOCAL?.[0]?.channel?.id
+                    ?? "1";
+                const streamKey = `call:${channelId}:1`;
 
-                const playActivity = async () => {
+                const runActivityQuest = async () => {
                     try {
-                        console.log("Completing quest", questName);
+                        console.log(`Completing activity quest ${questName} (${taskName}, app=${applicationId ?? "none"})`);
+                        try {
+                            FluxDispatcher.dispatch({ type: "QUEST_APPLICATION_START_TIMER", questId: quest.id });
+                        } catch {}
+
+                        let stagnantCycles = 0;
+                        let lastProgress = secondsDone;
 
                         while (true) {
-                            const body = applicationId
-                                ? { application_id: applicationId, terminal: false }
-                                : { stream_key: streamKey, terminal: false };
+                            if (!completingQuest.get(quest.id)) {
+                                completingQuest.set(quest.id, false);
+                                break;
+                            }
+
+                            const body: Record<string, any> = {
+                                stream_key: streamKey,
+                                terminal: false
+                            };
+                            if (applicationId) {
+                                body.application_id = applicationId;
+                            }
+
                             let res: any;
                             try {
                                 res = await RestAPI.post({ url: `/quests/${quest.id}/heartbeat`, body });
+                                if (res?.body) {
+                                    FluxDispatcher.dispatch({
+                                        type: "QUESTS_SEND_HEARTBEAT_SUCCESS",
+                                        userStatus: res.body,
+                                        questId: quest.id,
+                                        streamKey
+                                    });
+                                }
                             } catch (hbErr: any) {
                                 if (hbErr?.status === 429) {
                                     const retryMs = ((hbErr?.body?.retry_after as number) || 10) * 1000 + 500;
@@ -1121,16 +1397,26 @@ function completeQuest(quest: QuestValue) {
                                 }
                                 throw hbErr;
                             }
-                            const progress = res?.body?.progress?.PLAY_ACTIVITY?.value ?? 0;
-                            console.log(`Quest progress ${questName}: ${progress}/${secondsNeeded}`);
 
-                            if (!completingQuest.get(quest.id) || progress >= secondsNeeded || res?.body?.completed_at != null) {
+                            const progress = res?.body?.progress?.[taskName]?.value
+                                ?? res?.body?.progress?.PLAY_ACTIVITY?.value
+                                ?? res?.body?.progress?.ACHIEVEMENT_IN_ACTIVITY?.value
+                                ?? res?.body?.progress?.ACHIEVEMENT_IN_GAME?.value
+                                ?? 0;
+                            const isCompleted = res?.body?.completed_at != null || progress >= secondsNeeded;
+                            console.log(`Quest progress ${questName} (${taskName}): ${progress}/${secondsNeeded}`);
+
+                            if (!completingQuest.get(quest.id) || isCompleted) {
                                 console.log("Stopping completing quest:", questName);
 
-                                if (progress >= secondsNeeded || res?.body?.completed_at != null) {
-                                    const termBody = applicationId
-                                        ? { application_id: applicationId, terminal: true }
-                                        : { stream_key: streamKey, terminal: true };
+                                if (isCompleted) {
+                                    const termBody: Record<string, any> = {
+                                        stream_key: streamKey,
+                                        terminal: true
+                                    };
+                                    if (applicationId) {
+                                        termBody.application_id = applicationId;
+                                    }
                                     try {
                                         await RestAPI.post({ url: `/quests/${quest.id}/heartbeat`, body: termBody });
                                     } catch (termErr: any) {
@@ -1142,20 +1428,48 @@ function completeQuest(quest: QuestValue) {
                                             }
                                         }
                                     }
-                                    console.log("Quest completed!");
+                                    console.log("Quest completed:", questName);
+                                    completingQuest.set(quest.id, true);
+                                    setTimeout(() => {
+                                        if (!quest.userStatus?.completedAt) {
+                                            completingQuest.set(quest.id, false);
+                                        }
+                                        updateQuests();
+                                    }, 10000);
+                                    setTimeout(updateQuests, 2000);
+                                } else {
                                     completingQuest.set(quest.id, false);
                                 }
                                 break;
                             }
 
+                            if (isAchievementTask) {
+                                if (progress <= lastProgress) {
+                                    stagnantCycles++;
+                                } else {
+                                    stagnantCycles = 0;
+                                    lastProgress = progress;
+                                }
+                                if (stagnantCycles >= 2) {
+                                    attemptedAchievementQuestIds.add(quest.id);
+                                    completingQuest.set(quest.id, true);
+                                    console.log(`[CompleteDiscordQuest] ${questName} (${taskName}) enrolled & heartbeat initialized; awaiting server-side activity achievement event.`);
+                                    setTimeout(updateQuests, 2000);
+                                    break;
+                                }
+                            }
+
                             await new Promise(resolve => setTimeout(resolve, (60 * 1000) + Math.floor(Math.random() * 1500)));
                         }
                     } catch (err) {
-                        console.error("Error in playActivity for quest:", questName, err);
+                        console.error("Error in runActivityQuest for quest:", questName, err);
+                        if (isAchievementTask) {
+                            attemptedAchievementQuestIds.add(quest.id);
+                        }
                         completingQuest.set(quest.id, false);
                     }
                 };
-                playActivity();
+                runActivityQuest();
                 break;
             }
 

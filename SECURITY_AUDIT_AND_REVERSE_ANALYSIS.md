@@ -1,27 +1,16 @@
 # Full Reverse-Engineering Audit of Discord Quest Anti-Fraud Protection (`discord_utils.node`, `libdiscore-wasm`, `discord_web_bundle.js`)
 
-## 1. Executive Summary: Why Unpatched `completeDiscordQuest` Triggers `Quest Activity Notice`
+## 1. Executive Summary: Why Existing Quest Tools Trigger `Quest Activity Notice`
 
 Through static and dynamic reverse engineering of the Windows Discord Desktop client (`app-1.0.9265`), specifically:
 - **`discord_utils.node`** (Native C++ process scanner & Authenticode verifier, analyzed in IDA Pro)
 - **`libdiscore-wasm`** (Rust/WASM telemetry & client-modification detector)
 - **`discord_web_bundle.js`** (Webpack modules `396813`, `378187`, `973522`, `952818`, `499785`, `174459`, `70298`)
 
-we identified the exact client-side and server-side detection vectors that cause Discord to issue **`Quest Activity Notice`** warnings when users run `nicola02nb/completeDiscordQuest`:
-
-1. **Missing `executableFingerprint` in `fakeGame` (`index.tsx:327-339`):**
-   - When `RunningGameStore.getRunningGames()` is spoofed, `QuestProgressManager` (`Module 378187`) calls `sendHeartbeat` (`Module 396813` `ea(e)`), which extracts `executable_path: (0, o.Ic)(t?.exePath)` and `executable_fingerprint: t?.executableFingerprint`.
-   - Because `fakeGame` omits `executableFingerprint` (and 10 other native scanner properties), every `POST /quests/{id}/heartbeat` sends `executable_fingerprint: undefined`.
-2. **Vencord Client-Mod Bitfield in `X-Super-Properties.launch_signature` (`libdiscore-wasm`):**
-   - `libdiscore-wasm`'s `generateLaunchSignature()` probes `window` globals (`window.Vencord`, `window.VencordNative`, `window.$`, `window.BdApi`, etc.) and sets 12 specific bits (`[0, 19, 27, 36, 43, 52, 66, 72, 79, 89, 103, 116]`, MSB-first) inside the 128-bit `launch_signature` UUIDv4 sent in `X-Super-Properties` on every `/quests/*` request. Bit 43 specifically flags `window.Vencord`.
-3. **`vencord://` Stack Trace Leak in `network_action_quest_heartbeat` (`Module 499785`):**
-   - `Module 396813` (`ea(e)`) sends quest heartbeats via `HTTPWithAnalytics.post` (`Module 499785`), which dispatches a `network_action_quest_heartbeat` science event containing `stack_trace: Error().stack ?? ""`. Without an `Error.prototype.stack` sanitizer, `stack_trace` directly leaks `vencord://` and `CompleteDiscordQuest` frames to Discord's telemetry pipeline.
-4. **Self-Identifying String in `STREAM_ON_DESKTOP` (`index.tsx:374`):**
-   - `fakeApp` sets `name: "FakeApp ${applicationName} (CompleteDiscordQuest)"` inside `ApplicationStreamingStore.getStreamerActiveStreamMetadata()`.
-5. **Destructive `RunningGameStore.getRunningGames` Override (`index.tsx:72, 126`):**
-   - When `fakeGames.size > 0`, `getRunningGames()` replaces all genuinely running games instead of merging them, causing an unnatural simultaneous drop of all background games in `RUNNING_GAMES_CHANGE` and breaking `stopAllFarming()` cleanup (since `RunningGameStore.getRunningGames()` called on line 240 while `fakeGames` was just cleared or active returns inconsistent state).
-6. **Integer `timestamp` on Final `WATCH_VIDEO` Request & Legacy `PLAY_ACTIVITY` Payload:**
-   - Line 314 sends `{ timestamp: secondsNeeded }` as an exact integer on the final `/video-progress` request, and `PLAY_ACTIVITY` uses a 20s `stream_key` loop instead of Discord's 60s `{ application_id, terminal }` contract.
+we identified the exact client-side and server-side detection vectors that cause Discord to issue **`Quest Activity Notice`** warnings and suspend Quest access when users run:
+1. **`aamiaa/CompleteDiscordQuest.md`** (DevTools Console script)
+2. **`nicola02nb/completeDiscordQuest`** (Vencord / BetterDiscord plugin)
+3. **`Masterain98/discord-quest-helper`** (Tauri + Rust + CDP + dummy PE runner)
 
 ---
 
@@ -53,13 +42,105 @@ Finally, `sub_116790` Base64-encodes the 146-byte buffer into a **196-character 
 
 ---
 
-## 3. What This Patch Fixes in `completeDiscordQuest`
+## 3. Quest Heartbeat & Telemetry Pipeline in `discord_web_bundle.js`
 
-1. **WebCrypto `sub_a3990` / `sub_a4120` / `sub_1350` `executableFingerprint` Synthesis:**
-   - Synthesizes a valid 196-character Base64 `executableFingerprint` for every spoofed `PLAY_ON_DESKTOP` game (`version = 0x01` un-XORed at `[0x00]`, `flags = 0x03` `is_signed | is_pe64` at `[0x01]`, realistic 48–140 MB `file_size`, `time_date_stamp`, page-aligned `size_of_image`, deterministic `pe_headers_sha256`, harvested local `hw_sha256` block `[0x32..0x51]`, `sections_sha256`, and `cert_sha256`), XORing bytes `[1..145]` with `xor_key[(i - 1) & 31]`.
-2. **Full 22-Key `RunningGameStore` Schema & Non-Destructive Merging:**
-   - Populates all 22 properties expected by `RunningGameStore` (`distributor`, `elevated`, `executableFingerprint`, `fullscreenType`, `gameMetadata`, `lastFocused`, `nativeProcessObserverId`, `origGameName`, `sandboxed`, `sku`, `windowHandle`, etc.) and merges spoofed games with real running games instead of wiping them out.
-3. **`launch_signature` 12-Bit Client-Mod Scrubber & `Error.prototype.stack` Sanitizer:**
-   - Clears all 12 client-mod detection bits (`[0, 19, 27, 36, 43, 52, 66, 72, 79, 89, 103, 116]`) from `X-Super-Properties.launch_signature` and strips `vencord://` / `CompleteDiscordQuest` frames from `Error().stack`.
-4. **Removes Self-Identifying `FakeApp ... (CompleteDiscordQuest)` String & Fixes `WATCH_VIDEO` / `PLAY_ACTIVITY` Telemetry:**
-   - Uses clean `applicationName` metadata in `STREAM_ON_DESKTOP`, sub-second float jitter on all `/video-progress` calls, and 60s `{ application_id, terminal }` heartbeats on `PLAY_ACTIVITY`.
+### 3.1 `Module 396813` (`ea(e)` — `QUESTS_HEARTBEAT`) & `Module 973522` (`o.Ic`)
+
+When `QuestProgressManager` (`Module 378187`) sends a desktop play heartbeat, it executes `ea(e)` in `Module 396813`:
+```js
+let t = m.Ay.getRunningGames().find(t => t.id === n),
+    r = (0, o.Ic)(t?.exePath),
+    i = t?.executableFingerprint;
+return L.A.post({
+    url: R.Rsh.QUESTS_HEARTBEAT(e),
+    body: {
+        stream_key: a,
+        container_id: s,
+        application_id: n,
+        terminal: l,
+        executable_path: r,
+        executable_fingerprint: i
+    }
+});
+```
+where `o.Ic` (`Module 973522`) normalizes `exePath` to the **last 2 lowercase `/` segments**:
+```js
+function u(e) {
+    return null == e ? null : e.toLowerCase().replaceAll("\\", "/").split("/").filter(e => "" !== e).slice(-2).join("/");
+}
+```
+
+### 3.2 `Module 499785` (`L.A.post` — `HTTPWithAnalytics`) Stack Trace Leak
+
+Crucially, `Module 396813` does **not** use raw `RestAPI.post` (`o.Bo.post`). It calls `L.A.post` (`Module 499785`), which wraps `RestAPI.post` and dispatches the `network_action_quest_heartbeat` science analytics event containing:
+```js
+{
+    quest_id: i,
+    application_id: t.body?.application_id,
+    executable_path: t.body?.executable_path,
+    executable_fingerprint: t.body?.executable_fingerprint,
+    stack_trace: Error().stack ?? "",
+    is_playtime_eligible: a
+}
+```
+- If a tool calls raw `RestAPI.post({ url: "/quests/.../heartbeat" })`, Discord's backend receives the HTTP heartbeat **without** the corresponding `network_action_quest_heartbeat` science event.
+- If a tool triggers `QuestProgressManager` from a Vencord plugin or DevTools console without sanitizing `Error.prototype.stack`, `stack_trace` directly transmits `vencord://`, `CompleteDiscordQuest`, or `<anonymous>:` frames!
+
+### 3.3 `libdiscore-wasm` `generateLaunchSignature` (128-Bit Client-Mod Bitfield)
+
+Every API request includes `X-Super-Properties` (Base64 JSON). Inside `libdiscore-wasm` (called by `Module 174459` / `Module 70298`), `generateLaunchSignature()` generates a 128-bit UUIDv4 and probes `window` properties (`window.$`, `window.Vencord`, `window.VencordNative`, `window.BdApi`, `window.BetterDiscord`, etc.), setting specific bits in the UUID (`[0, 19, 27, 36, 43, 52, 66, 72, 79, 89, 103, 116]`, MSB-first where Bit 0 is `window.$` and Bit 43 is `window.Vencord`).
+- Deleting `window.$` in the console *after* Discord has already booted does **not** clear Bit 0 from the already-cached `X-Super-Properties.launch_signature`.
+- Running inside Vencord sets **Bit 43** on every `/quests/*` request unless `launch_signature` is scrubbed.
+
+### 3.4 `Module 396813`, `Module 710969`, & `Module 738822`: Sealed Ad-Decision Metadata, Interactive Quests (`ACHIEVEMENT_IN_ACTIVITY`), & Multi-Platform Reward Claiming
+
+1. **Background Fetching & Backfilling of `metadata_sealed` / `traffic_metadata_sealed` (`Module 396813` & `Module 710969`):**
+   - When Discord fetches quests or ad decisions (`N1` = `fetchCurrentQuests("quest_home")`, `r8` = `fetchQuestToDeliver(placement)`, `yO` = `fetchEarnedQuestToDeliver()`), `QuestsStore` and `AdDeliveryStore` (`getQuestAdDecisionByQuestId(questId)`) populate `metadataSealed`, `trafficMetadataRaw`, and `trafficMetadataSealed`.
+   - When enrolling (`Oy` -> `POST /quests/{id}/enroll`) or claiming a reward (`Oq` -> `POST /quests/{id}/claim-reward`), `Module 396813` uses `Module 710969` (`p(questContent)`) to map `questContent` (`1` = `QUEST_BAR_V2`, `10` = `QUEST_HOME_DESKTOP`) to placement `1`, attaches `metadata_sealed` when `p(location) === 1`, and always attaches `traffic_metadata_raw` and `traffic_metadata_sealed`.
+   - Enrolling or claiming in the background without opening Quest Home previously omitted `metadata_sealed` and `traffic_metadata_sealed`. Invoking `N1("quest_home")` / `r8(1)` / `yO()` in the background and backfilling `metadata_sealed`, `traffic_metadata_raw`, and `traffic_metadata_sealed` from `QuestsStore` and `AdDeliveryStore` guarantees identical payloads without opening the Quest Home tab.
+2. **Interactive Activity Quests (`ACHIEVEMENT_IN_ACTIVITY` / `PLAY_ACTIVITY` — `Module 396813` `R2`):**
+   - Interactive activity quests (such as `VALORANT Aces`) use task type `ACHIEVEMENT_IN_ACTIVITY` or `PLAY_ACTIVITY` with `questContentCTA: "START_QUEST"`.
+   - In `Module 396813` (`R2`), activity heartbeats (`POST /quests/{id}/heartbeat`) send `{ stream_key: "call:<channelId>:1", application_id: "<appId>", terminal: false }` (and `terminal: true` on completion) without desktop `.exe` fields (`executable_path` / `executable_fingerprint`).
+3. **Configurable Multi-Platform Reward Priority (`Module 738822` `QuestRewardPlatform`):**
+   - `Module 738822` defines `QuestRewardPlatform`: `CROSS_PLATFORM = 0`, `XBOX = 1`, `PLAYSTATION = 2`, `SWITCH = 3`, `PC = 4`.
+   - For multi-platform `REWARD_CODE` quests (`rewardsConfig.platforms.length > 1`), selecting the highest-priority available platform according to a configurable priority order (default `[4, 2, 1, 3, 0]` = `PC -> PS5/PlayStation -> Xbox -> Switch -> Cross-Platform`) enables automatic reward claiming without user intervention.
+
+---
+
+## 4. Vulnerability Breakdown by Repository
+
+### 4.1 `aamiaa/CompleteDiscordQuest.md`
+1. **`executableFingerprint` is `undefined`:** `fakeGame` only defines 11 properties and omits `executableFingerprint`. Every `PLAY_ON_DESKTOP` heartbeat sends `executable_fingerprint: undefined`.
+2. **Destructive `RunningGameStore` overwrite:** Replaces `getRunningGames()` with `[fakeGame]` and dispatches `removed: realGames`, causing an unnatural simultaneous drop of all background processes.
+3. **Late `delete window.$`:** Does not scrub already-set detection bits (`Bit 0`, `Bit 43`, etc.) in `X-Super-Properties.launch_signature`, nor does it sanitize `Error.prototype.stack`.
+4. **Exact integer `timestamp` on final `WATCH_VIDEO` POST:** Sends `{ timestamp: secondsNeeded }` as an exact integer and does not rate-gate against `enrolledAt` in the main snippet.
+
+### 4.2 `nicola02nb/completeDiscordQuest` (Vencord Plugin)
+1. **Guaranteed Client-Mod Flag (`Bit 43` in `launch_signature`) + `vencord://` in `stack_trace`:** Because it runs as a Vencord plugin without scrubbing `launch_signature` or `Error.prototype.stack`, every Quest heartbeat carries Vencord's bitfield signature in `X-Super-Properties` and Vencord stack frames in `network_action_quest_heartbeat`.
+2. **Missing `executableFingerprint` & incomplete 22-key `RunningGameStore` schema:** `fakeGame` in `index.tsx` lacks `executableFingerprint`, sending `executable_fingerprint: undefined` on `PLAY_ON_DESKTOP` heartbeats.
+3. **Unnatural `STREAM_ON_DESKTOP` metadata:** Sets `name: "FakeApp ${applicationName} (CompleteDiscordQuest)"` on `fakeApp`.
+
+### 4.3 `Masterain98/discord-quest-helper`
+1. **Unsigned Dummy PE (`stagecraft.exe` / `stealth_pe.rs`) Fails `WinVerifyTrust`:**
+   - When `discord_utils.node` scans the dummy process, `WinVerifyTrust` (`0x1800a4224`) returns non-zero (`is_signed = 0`, so `flags` bit 0 is `0`), `cert_sha256` (`[0x72..0x91]`) is 32 zero bytes (`00..00`), and `file_size` is ~150 KB instead of a 48–140 MB Authenticode-signed game binary.
+2. **CDP Spoof Explicitly Sets `executableFingerprint: undefined` (`cdp_quest.rs:497`):**
+   - In CDP mode (`js_spoof_play_game_for`), `fakeGame.executableFingerprint` is hardcoded to `undefined`!
+3. **Direct API Game Heartbeat Omits `executable_path` & `executable_fingerprint` (`discord_api.rs:900`):**
+   - `GameHeartbeatPayload` only serializes `{ application_id, terminal }`, omitting `executable_path` and `executable_fingerprint` completely.
+4. **Video Progress Float Jitter Destroyed by `timestamp.round() as u64` (`discord_api.rs:195`):**
+   - `quest_completer.rs:123` adds `rand::rng().random_range(0.0..0.5)`, but `discord_api.rs:195` immediately calls `timestamp.round() as u64`, turning every timestamp back into an integer!
+
+---
+
+## 5. Summary of Applied Stealth Fixes
+
+1. **`sub_a3990` / `sub_a4120` / `sub_a3f60` / `sub_1350` Signed `executableFingerprint` Synthesis:**
+   - Synthesizes a valid 146-byte (`0x92`) binary payload with un-XORed `version = 0x01`, `flags = 0x03` (`is_signed | is_pe64`), realistic 48–140 MB `file_size`, valid PE `time_date_stamp` and page-aligned `size_of_image`, deterministic `pe_headers_sha256` (`[0x12..0x31]`), real local `hw_sha256` (`[0x32..0x51]`, harvested from existing native process entries or computed from `SHA-256(MachineGuid || userId)`), `sections_sha256` (`[0x52..0x71]`), and `cert_sha256` (`[0x72..0x91]`, `SHA-256(UTF8(Publisher_CN) || SPKI_SHA256)`), XORed on bytes `1..145` with `SHA-256(userId + "https://discord.com/careers")` and Base64-encoded to 196 characters.
+2. **`Module 973522` (`o.Ic`) 2-Segment `executable_path` Formatting:**
+   - Ensures all `exePath` and `executable_path` values conform to Discord's 2-segment lowercase forward-slash format.
+3. **`launch_signature` 12-Bit Client-Mod Scrubber & `Error.prepareStackTrace` Sanitizer:**
+   - Clears all 12 client-mod bits (`[0, 19, 27, 36, 43, 52, 66, 72, 79, 89, 103, 116]`) in `X-Super-Properties` and strips `<anonymous>`, `vencord://`, and plugin frames via `Error.prepareStackTrace` (without mutating `Error.prototype.stack`'s property descriptor).
+4. **Sub-Second Floating-Point `WATCH_VIDEO` Timestamps, Non-Destructive `RunningGameStore` Merging, & 15s PID Tombstone Cache:**
+   - Preserves realistic millisecond float precision (`f64`) on `/video-progress`, merges spoofed games non-destructively with all 22 `RunningGameStore` schema keys, and retains a 15-second PID tombstone in `getGameForPID` so `OverlayRenderStore` never logs `untracked pid` warnings on teardown.
+5. **Sealed Metadata Auto-Fetch (`metadata_sealed` / `traffic_metadata_sealed`), `ACHIEVEMENT_IN_ACTIVITY` Support, & Configurable Multi-Platform Auto-Claim (`rewardPlatformPriority`):**
+   - Automatically triggers Discord's internal Quest Decision / Current Quests fetchers in the background and backfills `metadata_sealed`, `traffic_metadata_raw`, and `traffic_metadata_sealed` from `QuestsStore` and `AdDeliveryStore` on `/enroll` and `/claim-reward`; supports `ACHIEVEMENT_IN_ACTIVITY` and `PLAY_ACTIVITY` heartbeats with `stream_key` + `application_id`; and automatically selects the preferred reward platform (`PC -> PS5 -> Xbox -> Switch`) on multi-platform `REWARD_CODE` quests.

@@ -20,8 +20,20 @@ export default definePluginSettings({
     },
     claimRewardsAutomatically: {
         type: OptionType.BOOLEAN,
-        description: "Whether to automatically claim single-platform quest rewards (Orbs, Decorations, Nitro, single-platform codes). Multi-platform and Captcha-gated rewards are safely skipped.",
-        default: false
+        description: "Whether to automatically claim completed quest rewards (Orbs, Decorations, Nitro, and single/multi-platform reward codes using the configured platform priority).",
+        default: true
+    },
+    rewardPlatformPriority: {
+        type: OptionType.SELECT,
+        description: "Preferred platform priority when automatically claiming multi-platform reward codes (e.g. PC vs PS5 vs Xbox vs Switch).",
+        options: [
+            { label: "PC -> PlayStation (PS5) -> Xbox -> Switch (Default)", value: "4,2,1,3,0", default: true },
+            { label: "PC -> Xbox -> PlayStation (PS5) -> Switch", value: "4,1,2,3,0" },
+            { label: "PlayStation (PS5) -> PC -> Xbox -> Switch", value: "2,4,1,3,0" },
+            { label: "Xbox -> PC -> PlayStation (PS5) -> Switch", value: "1,4,2,3,0" },
+            { label: "Switch -> PC -> PlayStation (PS5) -> Xbox", value: "3,4,2,1,0" },
+            { label: "Skip multi-platform rewards (choose manually)", value: "manual" }
+        ]
     },
     showQuestsButtonTopBar: {
         type: OptionType.BOOLEAN,
@@ -58,6 +70,11 @@ export default definePluginSettings({
     farmPlayActivity: {
         type: OptionType.BOOLEAN,
         description: "Whether to farm play activity quests automatically.",
+        default: true
+    },
+    farmAchievementInActivity: {
+        type: OptionType.BOOLEAN,
+        description: "Whether to farm interactive activity / achievement quests automatically.",
         default: true
     },
     farmRewardCodes: {
