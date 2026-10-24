@@ -18,7 +18,7 @@ A Vencord(VC) plugin that completes multiple Discord quests in background simult
 
 ## Credits:
 
-This is a porting for BetterDiscord of a [snippet](https://gist.github.com/aamiaa/204cd9d42013ded9faf646fae7f89fbb) made by [aamiaa](https://github.com/aamiaa) ([Stealth Patched Fork](https://gist.github.com/ccsimplyspolit/920e65276bee60f424947fbc181cbcbd)).
+This is a porting for BetterDiscord of a [snippet](https://gist.github.com/aamiaa/204cd9d42013ded9faf646fae7f89fbb) made by [aamiaa](https://github.com/aamiaa) ([Stealth Patched Fork](https://gist.github.com/ccsimplyspolit/f323e1b626dff79bfc08b24bc3dc27bd)).
 
 ## Features:
 
