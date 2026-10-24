@@ -98,7 +98,6 @@ async function synthesizeSignedExecutableFingerprint(userId: string, appId: stri
     try {
         const candidates = [
             ...realGames,
-            ...(RunningGameStore?.getGamesSeen?.(false) ?? []),
             ...(RunningGameStore?.getCandidateGames?.() ?? [])
         ];
         for (const cand of candidates) {
@@ -109,7 +108,16 @@ async function synthesizeSignedExecutableFingerprint(userId: string, appId: stri
                 const plain = new Uint8Array(0x92);
                 plain[0] = raw[0];
                 for (let i = 1; i < 0x92; i++) plain[i] = raw[i] ^ xorKey[(i - 1) & 31];
-                if ((plain[1] & 0x01) !== 0) {
+                const plainView = new DataView(plain.buffer);
+                const flags = plain[1];
+                const fileSizeLow = plainView.getUint32(0x02, true);
+                const fileSizeHigh = plainView.getUint32(0x06, true);
+                const tds = plainView.getUint32(0x0A, true);
+                const imgSize = plainView.getUint32(0x0E, true);
+                if ((flags & 0x01) !== 0 && (flags & 0xFC) === 0
+                    && fileSizeHigh === 0 && fileSizeLow >= 4096
+                    && tds >= 0x386D4380 && tds <= 0x7FFFFFFF
+                    && imgSize >= 0x1000 && (imgSize & 0xFFF) === 0) {
                     harvestedHw = plain.slice(0x32, 0x52);
                     break;
                 }
