@@ -7,13 +7,14 @@
 import "./QuestButton.css";
 
 import { Flex } from "@components/Flex";
-import { findByCodeLazy, findByPropsLazy, findComponentByCodeLazy } from "@webpack";
+import { findByCodeLazy, findComponentByCodeLazy } from "@webpack";
 import { Tooltip, useEffect, useState } from "@webpack/common";
 
 import { QuestsStore } from "../stores";
 
 const QuestIcon = findByCodeLazy("\"M7.5 21.7a8.95");
-const { navigateToQuestHome } = findByPropsLazy("navigateToQuestHome");
+const rawNavigateToQuestHome = findByCodeLazy(".QUEST_HOME,{search:");
+const navigateToQuestHome = () => rawNavigateToQuestHome?.({});
 const TopBarButton = findComponentByCodeLazy(".HEADER_BAR_BADGE_BOTTOM,", 'position:"bottom"');
 const SettingsBarButton = findComponentByCodeLazy("keyboardShortcut", "positionKey");
 const CountBadge = findComponentByCodeLazy("renderBadgeCount", "disableColor");
@@ -49,9 +50,13 @@ export function QuestsCount() {
     };
 
     useEffect(() => {
-        QuestsStore.addChangeListener(checkForNewQuests);
+        try {
+            QuestsStore?.addChangeListener?.(checkForNewQuests);
+        } catch { }
         return () => {
-            QuestsStore.removeChangeListener(checkForNewQuests);
+            try {
+                QuestsStore?.removeChangeListener?.(checkForNewQuests);
+            } catch { }
         };
     }, []);
 
@@ -121,9 +126,13 @@ export function QuestButton({ type }: { type: "top-bar" | "settings-bar"; }) {
     };
 
     useEffect(() => {
-        QuestsStore.addChangeListener(checkForNewQuests);
+        try {
+            QuestsStore?.addChangeListener?.(checkForNewQuests);
+        } catch { }
         return () => {
-            QuestsStore.removeChangeListener(checkForNewQuests);
+            try {
+                QuestsStore?.removeChangeListener?.(checkForNewQuests);
+            } catch { }
         };
     }, []);
 
@@ -163,7 +172,7 @@ export function QuestButton({ type }: { type: "top-bar" | "settings-bar"; }) {
                     badgePosition={"bottom"}
                     icon={QuestIcon}
                     iconSize={20}
-                    onClick={navigateToQuestHome}
+                    onClick={undefined}
                     onContextMenu={undefined}
                     hideOnClick={false}
                 /></SettingsBarButton>

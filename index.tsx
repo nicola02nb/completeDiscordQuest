@@ -506,70 +506,74 @@ async function ensureSealedQuestMetadata(questId?: string): Promise<void> {
     } catch {}
 }
 
+const questRestHookedFns = new WeakSet<Function>();
+
 function installQuestRestInterceptor() {
     try {
-        if (!RestAPI || typeof RestAPI.post !== "function" || isStealthHooked(RestAPI.post)) return;
+        if (!RestAPI || typeof RestAPI.post !== "function" || questRestHookedFns.has(RestAPI.post)) return;
         const rawPost = RestAPI.post;
         const origPost = rawPost.bind(RestAPI);
-        const wrappedPost = cloakFunction(async function (req: any, ...rest: any[]) {
+        const wrappedPost = cloakFunction(function (this: any, ...args: any[]) {
+            const req = args[0];
+            const url = typeof req === "string" ? req : req?.url;
+            if (typeof url !== "string" || !url.includes("/quests/")) {
+                return (origPost as any).apply(this ?? RestAPI, args);
+            }
             try {
-                const url = typeof req === "string" ? req : req?.url;
-                if (typeof url === "string" && url.includes("/quests/")) {
-                    const body = req?.body;
-                    if (body && typeof body === "object") {
-                        const hbMatch = url.match(/\/quests\/([^/]+)\/heartbeat/);
-                        if (hbMatch && !body.stream_key && !(body.terminal === true && !body.executable_path)) {
-                            const questId = hbMatch[1];
-                            const fake = fakeGames.get(questId);
-                            if (fake) {
-                                if (!body.executable_path) {
-                                    body.executable_path = formatQuestExecutablePath(fake.exePath);
-                                } else {
-                                    body.executable_path = formatQuestExecutablePath(body.executable_path);
-                                }
-                                if (!body.executable_fingerprint && fake.executableFingerprint) {
-                                    body.executable_fingerprint = fake.executableFingerprint;
-                                }
-                            } else if (body.executable_path) {
+                const body = req?.body;
+                if (body && typeof body === "object") {
+                    const hbMatch = url.match(/\/quests\/([^/]+)\/heartbeat/);
+                    if (hbMatch && !body.stream_key && !(body.terminal === true && !body.executable_path)) {
+                        const questId = hbMatch[1];
+                        const fake = fakeGames.get(questId);
+                        if (fake) {
+                            if (!body.executable_path) {
+                                body.executable_path = formatQuestExecutablePath(fake.exePath);
+                            } else {
                                 body.executable_path = formatQuestExecutablePath(body.executable_path);
                             }
+                            if (!body.executable_fingerprint && fake.executableFingerprint) {
+                                body.executable_fingerprint = fake.executableFingerprint;
+                            }
+                        } else if (body.executable_path) {
+                            body.executable_path = formatQuestExecutablePath(body.executable_path);
                         }
+                    }
 
-                        const enrollOrClaim = url.match(/\/quests\/([^/]+)\/(?:enroll|claim-reward)/);
-                        if (enrollOrClaim) {
-                            const questId = enrollOrClaim[1];
-                            if (body.metadata_sealed == null || body.traffic_metadata_sealed == null) {
-                                await ensureSealedQuestMetadata(questId);
-                            }
-                            const q = (QuestsStore?.getQuest?.(questId) ?? QuestsStore?.quests?.get?.(questId)) as any;
-                            const adMap = AdDeliveryStore?.deliveryAdDecisionByPlacement;
-                            const adDecision1 = adMap?.get?.(1);
-                            const adDecision3 = adMap?.get?.(3);
+                    const enrollOrClaim = url.match(/\/quests\/([^/]+)\/(?:enroll|claim-reward)/);
+                    if (enrollOrClaim) {
+                        const questId = enrollOrClaim[1];
+                        const q = (QuestsStore?.getQuest?.(questId) ?? QuestsStore?.quests?.get?.(questId)) as any;
+                        const adMap = AdDeliveryStore?.deliveryAdDecisionByPlacement;
+                        const adDecision1 = adMap?.get?.(1);
+                        const adDecision3 = adMap?.get?.(3);
 
-                            if (body.metadata_sealed == null) {
-                                const sealed =
-                                    q?.metadataSealed ||
-                                    q?.metadata_sealed ||
-                                    q?.config?.metadataSealed ||
-                                    adDecision1?.metadataSealed ||
-                                    adDecision3?.metadataSealed;
-                                if (sealed) body.metadata_sealed = sealed;
-                            }
-                            if (body.traffic_metadata_sealed == null) {
-                                const trafficSealed =
-                                    q?.trafficMetadataSealed ||
-                                    q?.traffic_metadata_sealed ||
-                                    q?.config?.trafficMetadataSealed ||
-                                    adDecision1?.trafficMetadataSealed ||
-                                    adDecision3?.trafficMetadataSealed;
-                                if (trafficSealed) body.traffic_metadata_sealed = trafficSealed;
-                            }
+                        if (body.metadata_sealed == null) {
+                            const sealed =
+                                q?.metadataSealed ||
+                                q?.metadata_sealed ||
+                                q?.config?.metadataSealed ||
+                                adDecision1?.metadataSealed ||
+                                adDecision3?.metadataSealed;
+                            if (sealed) body.metadata_sealed = sealed;
+                            else ensureSealedQuestMetadata(questId);
+                        }
+                        if (body.traffic_metadata_sealed == null) {
+                            const trafficSealed =
+                                q?.trafficMetadataSealed ||
+                                q?.traffic_metadata_sealed ||
+                                q?.config?.trafficMetadataSealed ||
+                                adDecision1?.trafficMetadataSealed ||
+                                adDecision3?.trafficMetadataSealed;
+                            if (trafficSealed) body.traffic_metadata_sealed = trafficSealed;
+                            else ensureSealedQuestMetadata(questId);
                         }
                     }
                 }
             } catch {}
-            return origPost(req, ...rest);
+            return (origPost as any).apply(this ?? RestAPI, args);
         }, rawPost, "post");
+        questRestHookedFns.add(wrappedPost);
         RestAPI.post = wrappedPost;
         storeCleanupCallbacks.push(() => {
             RestAPI.post = rawPost;
@@ -690,7 +694,7 @@ export default definePlugin({
         installQuestRestInterceptor();
     },
     start() {
-        if ((window as any).__OVERLAY__) return;
+        if ((window as any).__OVERLAY__ || window.name === "DISCORD_OutOfProcessOverlay" || location.pathname.startsWith("/overlay")) return;
         if (!ensureHasAcceptedToUsePlugin()) {
             stopAllFarming();
             return;
@@ -1394,6 +1398,13 @@ function completeQuest(quest: QuestValue) {
                                     const retryMs = ((hbErr?.body?.retry_after as number) || 10) * 1000 + 500;
                                     await new Promise(resolve => setTimeout(resolve, retryMs));
                                     continue;
+                                }
+                                if (isAchievementTask && hbErr?.status >= 400 && hbErr?.status < 500) {
+                                    attemptedAchievementQuestIds.add(quest.id);
+                                    completingQuest.set(quest.id, true);
+                                    console.log(`[CompleteDiscordQuest] ${questName} (${taskName}) enrolled; awaiting server-side activity achievement event.`);
+                                    setTimeout(updateQuests, 2000);
+                                    break;
                                 }
                                 throw hbErr;
                             }
