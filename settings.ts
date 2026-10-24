@@ -21,7 +21,7 @@ export default definePluginSettings({
     claimRewardsAutomatically: {
         type: OptionType.BOOLEAN,
         description: "Whether to automatically claim single-platform quest rewards (Orbs, Decorations, Nitro, single-platform codes). Multi-platform and Captcha-gated rewards are safely skipped.",
-        default: true
+        default: false
     },
     showQuestsButtonTopBar: {
         type: OptionType.BOOLEAN,

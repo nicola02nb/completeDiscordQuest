@@ -11,7 +11,7 @@ import { FluxDispatcher, RestAPI } from "@webpack/common";
 
 import { QuestButton, QuestsCount } from "./components/QuestButton";
 import settings from "./settings";
-import { ChannelStore, GuildChannelStore, QuestsStore, RunningGameStore, SuperPropertiesStore, UserStore } from "./stores";
+import { ApplicationStreamingStore, ChannelStore, GuildChannelStore, QuestsStore, RunningGameStore, SuperPropertiesStore, UserStore } from "./stores";
 
 const QuestApplyAction = findByCodeLazy("type:\"QUESTS_ENROLL_BEGIN\"") as (questId: string, action: QuestAction) => Promise<any>;
 const QuestClaimAction = findByCodeLazy("type:\"QUESTS_CLAIM_REWARD_BEGIN\"") as (questId: string, platform: number, location: number) => Promise<any>;
@@ -28,8 +28,10 @@ const claimingQuestIds = new Set<string>();
 const failedClaimQuestIds = new Set<string>();
 let claimLoopRunning = false;
 const fakeGames = new Map<string, any>();
+const recentFakeGamesByPid = new Map<number, { game: any; expiresAt: number }>();
 const fakeApplications = new Map<string, any>();
 const activeHeartbeatListeners = new Set<(event: any) => void>();
+const storeCleanupCallbacks: Array<() => void> = [];
 
 // 12 client-mod / DevTools detection bits in libdiscore-wasm generateLaunchSignature (MSB-first 0..127)
 const CLIENT_MOD_DETECTION_BITS = [0, 19, 27, 36, 43, 52, 66, 72, 79, 89, 103, 116];
@@ -47,7 +49,11 @@ function ensureToStringCloak() {
             if (typeof this === "function" && hookedFunctions.has(this)) {
                 return hookedFunctions.get(this)!;
             }
-            return origToString.call(this);
+            const raw = origToString.call(this);
+            if (typeof raw === "string" && raw.length < 600 && /Vencord\.Plugins\.plugins\[/.test(raw)) {
+                return `function ${this?.name || ""}() { [native code] }`;
+            }
+            return raw;
         };
         hookedFunctions.set(cloakedToString, origToString.call(origToString));
         Object.defineProperty(Function.prototype, "toString", {
@@ -63,9 +69,12 @@ function cloakFunction<T extends Function>(fn: T, originalFn?: Function | null, 
     ensureToStringCloak();
     try {
         const name = originalFn?.name || fallbackName;
-        const nativeSource = originalFn
-            ? Function.prototype.toString.call(originalFn)
+        let nativeSource = originalFn
+            ? (hookedFunctions.get(originalFn) ?? Function.prototype.toString.call(originalFn))
             : `function ${name}() { [native code] }`;
+        if (/Vencord|Vesktop|Equicord|BetterDiscord/i.test(nativeSource)) {
+            nativeSource = `function ${name}() { [native code] }`;
+        }
         hookedFunctions.set(fn, nativeSource);
     } catch {}
     return fn;
@@ -258,7 +267,7 @@ const REAL_PE_PROFILES: Record<string, {
         certSha256: "16bb0b974347dd4680ff91ef2d50f242c44d8f5d323e968f609aa606024ef095",
     },
     "arena/escapefromtarkovarena.exe": {
-        flags: 0x02,
+        flags: 0x03,
         fileSize: 3241984,
         timeDateStamp: 0x67b4340e,
         sizeOfImage: 0x329000,
@@ -349,19 +358,28 @@ async function synthesizeSignedExecutableFingerprint(
     const realProfile = REAL_PE_PROFILES[formattedPath];
     const hHw = await sha256("hw:" + navigator.userAgent + ":" + (navigator.hardwareConcurrency || 8) + ":" + String(userId ?? ""));
 
+    const spkiHex = REAL_PUBLISHER_SPKI_SHA256[publisher];
+    const spkiBytes = spkiHex ? hexToBytes32(spkiHex) : await sha256(`SPKI_DER_V1:${publisher}`);
+    const pubBytes = enc.encode(publisher);
+    const certInput = new Uint8Array(pubBytes.length + 32);
+    certInput.set(pubBytes, 0);
+    certInput.set(spkiBytes, pubBytes.length);
+    const hCert = new Uint8Array(await crypto.subtle.digest("SHA-256", certInput));
+
     const buf = new Uint8Array(0x92);
     const pktView = new DataView(buf.buffer);
     buf[0x00] = 0x01; // Version = 1 (un-XORed in sub_1350)
 
     if (realProfile) {
-        buf[0x01] = realProfile.flags;
+        buf[0x01] = realProfile.flags | 0x01;
         pktView.setBigUint64(0x02, BigInt(realProfile.fileSize), true);
         pktView.setUint32(0x0A, realProfile.timeDateStamp >>> 0, true);
         pktView.setUint32(0x0E, realProfile.sizeOfImage >>> 0, true);
         buf.set(hexToBytes32(realProfile.peHeadersSha256), 0x12);
         buf.set(harvestedHw && harvestedHw.length === 32 ? harvestedHw : hHw, 0x32);
         buf.set(hexToBytes32(realProfile.sectionsSha256), 0x52);
-        buf.set(hexToBytes32(realProfile.certSha256), 0x72);
+        const profileCert = /^0+$/.test(realProfile.certSha256) ? hCert : hexToBytes32(realProfile.certSha256);
+        buf.set(profileCert, 0x72);
     } else {
         const seed = `${appId}:${formattedPath}:${publisher}`;
         const seedHash = await sha256("seed:" + seed);
@@ -376,14 +394,6 @@ async function synthesizeSignedExecutableFingerprint(
 
         const hPeHeaders = await sha256(`PE_HEADERS_V1:${seed}:${timeDateStamp}:${sizeOfImage}`);
         const hSections = await sha256(`PE_SECTIONS_V1:${seed}:${sizeOfImage}`);
-
-        const spkiHex = REAL_PUBLISHER_SPKI_SHA256[publisher];
-        const spkiBytes = spkiHex ? hexToBytes32(spkiHex) : await sha256(`SPKI_DER_V1:${publisher}`);
-        const pubBytes = enc.encode(publisher);
-        const certInput = new Uint8Array(pubBytes.length + 32);
-        certInput.set(pubBytes, 0);
-        certInput.set(spkiBytes, pubBytes.length);
-        const hCert = new Uint8Array(await crypto.subtle.digest("SHA-256", certInput));
 
         buf[0x01] = 0x03; // Flags = is_signed (0x01) | is_pe64 (0x02)
         pktView.setBigUint64(0x02, fileSize, true);
@@ -444,27 +454,6 @@ export default definePlugin({
             }
         },
         {
-            find: "\"RunningGameStore\"",
-            group: true,
-            replacement: [
-                {
-                    match: /}getRunningGames\(\){return ([^}]+)}/,
-                    replace: "}getRunningGames(){return $self.getRunningGames($1)}"
-                },
-                {
-                    match: /}getGameForPID\((\i)\){/,
-                    replace: "}getGameForPID($1){const pid=$self.getGameForPID($1);if(pid){return pid;}"
-                }
-            ]
-        },
-        {
-            find: "ApplicationStreamingStore",
-            replacement: {
-                match: /}getStreamerActiveStreamMetadata\(\){/,
-                replace: "}getStreamerActiveStreamMetadata(){const metadata=$self.getStreamerActiveStreamMetadata();if(metadata){return metadata;}"
-            }
-        },
-        {
             find: "extendSuperProperties({launch_signature:",
             replacement: {
                 match: /launch_signature:(\i)/g,
@@ -472,7 +461,48 @@ export default definePlugin({
             }
         }
     ],
-    start: () => {
+    installRuntimeStoreHooks() {
+        const self = this;
+        try {
+            if (RunningGameStore) {
+                const rawGetGames = RunningGameStore.getRunningGames;
+                if (typeof rawGetGames === "function") {
+                    const boundGetGames = rawGetGames.bind(RunningGameStore);
+                    RunningGameStore.getRunningGames = cloakFunction(function () {
+                        return self.getRunningGames(boundGetGames());
+                    }, rawGetGames, "getRunningGames");
+                    storeCleanupCallbacks.push(() => {
+                        RunningGameStore.getRunningGames = rawGetGames;
+                    });
+                }
+                const rawGetPid = RunningGameStore.getGameForPID;
+                if (typeof rawGetPid === "function") {
+                    const boundGetPid = rawGetPid.bind(RunningGameStore);
+                    RunningGameStore.getGameForPID = cloakFunction(function (pid: number) {
+                        return self.getGameForPID(pid) ?? boundGetPid(pid);
+                    }, rawGetPid, "getGameForPID");
+                    storeCleanupCallbacks.push(() => {
+                        RunningGameStore.getGameForPID = rawGetPid;
+                    });
+                }
+            }
+            if (ApplicationStreamingStore) {
+                const rawGetStream = ApplicationStreamingStore.getStreamerActiveStreamMetadata;
+                if (typeof rawGetStream === "function") {
+                    const boundGetStream = rawGetStream.bind(ApplicationStreamingStore);
+                    ApplicationStreamingStore.getStreamerActiveStreamMetadata = cloakFunction(function () {
+                        return self.getStreamerActiveStreamMetadata() ?? boundGetStream();
+                    }, rawGetStream, "getStreamerActiveStreamMetadata");
+                    storeCleanupCallbacks.push(() => {
+                        ApplicationStreamingStore.getStreamerActiveStreamMetadata = rawGetStream;
+                    });
+                }
+            }
+        } catch (err) {
+            console.warn("[CompleteDiscordQuest] Failed to install runtime store hooks:", err);
+        }
+    },
+    start() {
         if (!ensureHasAcceptedToUsePlugin()) {
             stopAllFarming();
             return;
@@ -480,12 +510,18 @@ export default definePlugin({
 
         installStackTraceSanitizer();
         scrubCachedSuperProperties();
+        this.installRuntimeStoreHooks();
         QuestsStore.addChangeListener(updateQuests);
         updateQuests();
     },
-    stop: () => {
+    stop() {
         QuestsStore.removeChangeListener(updateQuests);
         stopAllFarming();
+        while (storeCleanupCallbacks.length > 0) {
+            try {
+                storeCleanupCallbacks.pop()?.();
+            } catch {}
+        }
         if (restoreStackGetter) {
             restoreStackGetter();
         }
@@ -542,7 +578,7 @@ export default definePlugin({
         }
         const merged = base.slice();
         for (const fake of fakeGames.values()) {
-            if (!merged.some(g => g && (String(g.id) === String(fake.id) || g.pid === fake.pid))) {
+            if (!merged.some(g => g && (String(g.id) === String(fake.id) || Number(g.pid) === Number(fake.pid)))) {
                 merged.push(fake);
             }
         }
@@ -550,8 +586,20 @@ export default definePlugin({
     },
 
     getGameForPID(pid) {
+        const numPid = Number(pid);
         if (fakeGames.size > 0) {
-            return Array.from(fakeGames.values()).find(game => game.pid === pid);
+            const match = Array.from(fakeGames.values()).find(game => Number(game.pid) === numPid || game.pid === pid);
+            if (match) return match;
+        }
+        if (recentFakeGamesByPid.size > 0 && !Number.isNaN(numPid)) {
+            const now = Date.now();
+            const entry = recentFakeGamesByPid.get(numPid);
+            if (entry) {
+                if (entry.expiresAt > now) {
+                    return entry.game;
+                }
+                recentFakeGamesByPid.delete(numPid);
+            }
         }
     },
 
@@ -710,12 +758,16 @@ async function processClaimQueue() {
             const location = QuestLocationMap?.QUEST_HOME_DESKTOP ?? 11;
 
             claimingQuestIds.add(questId);
+            let abortQueueOnCaptcha = false;
             try {
                 console.log("[CompleteDiscordQuest] Claiming completed quest reward:", questName);
                 if (typeof QuestClaimAction === "function") {
                     const res = await QuestClaimAction(questId, platform, location);
-                    if (res?.errors?.length > 0) {
+                    if (res?.errors?.length > 0 || res?.body?.captcha_key) {
                         failedClaimQuestIds.add(questId);
+                        if (res?.body?.captcha_key || /captcha/i.test(JSON.stringify(res?.errors || ""))) {
+                            abortQueueOnCaptcha = true;
+                        }
                     }
                 } else {
                     await RestAPI.post({
@@ -723,11 +775,17 @@ async function processClaimQueue() {
                         body: { platform, location }
                     });
                 }
-            } catch (claimErr) {
+            } catch (claimErr: any) {
                 failedClaimQuestIds.add(questId);
                 console.warn("[CompleteDiscordQuest] Auto-claim skipped/deferred to manual UI for:", questName, claimErr);
+                if (claimErr?.status === 400 || claimErr?.status === 403 || claimErr?.body?.captcha_key || /captcha/i.test(String(claimErr?.message || claimErr))) {
+                    abortQueueOnCaptcha = true;
+                }
             } finally {
                 claimingQuestIds.delete(questId);
+            }
+            if (abortQueueOnCaptcha) {
+                break;
             }
 
             const delayMs = 5000 + Math.floor(Math.random() * 3000);
@@ -755,6 +813,12 @@ function stopAllFarming() {
 
     if (fakeGames.size > 0) {
         const removedGames = Array.from(fakeGames.values());
+        const expiresAt = Date.now() + 15000;
+        for (const rg of removedGames) {
+            if (rg?.pid != null) {
+                recentFakeGamesByPid.set(Number(rg.pid), { game: rg, expiresAt });
+            }
+        }
         fakeGames.clear();
         const games = RunningGameStore?.getRunningGames?.() ?? [];
         FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: removedGames, added: [], games });
@@ -861,7 +925,7 @@ function completeQuest(quest: QuestValue) {
                             const jitterMs = Math.floor(Math.random() * 1500);
                             await new Promise(resolve => setTimeout(resolve, interval * 1000 + jitterMs));
                         }
-                        if (!completed && secondsDone < secondsNeeded && completingQuest.get(quest.id)) {
+                        if (!completed && completingQuest.get(quest.id)) {
                             try {
                                 const res = await RestAPI.post({ url: `/quests/${quest.id}/video-progress`, body: { timestamp: secondsNeeded } });
                                 completed = res?.body?.completed_at != null;
@@ -960,6 +1024,7 @@ function completeQuest(quest: QuestValue) {
                                 if (!completingQuest.get(quest.id) || progress >= secondsNeeded) {
                                     console.log("Stopping completing quest:", questName);
 
+                                    recentFakeGamesByPid.set(Number(fakeGame.pid), { game: fakeGame, expiresAt: Date.now() + 15000 });
                                     fakeGames.delete(quest.id);
                                     const games = RunningGameStore?.getRunningGames?.() ?? [];
                                     FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: [fakeGame], added: [], games });
