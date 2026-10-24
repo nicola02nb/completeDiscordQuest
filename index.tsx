@@ -10,7 +10,7 @@ import { FluxDispatcher, RestAPI } from "@webpack/common";
 
 import { QuestButton, QuestsCount } from "./components/QuestButton";
 import settings from "./settings";
-import { ChannelStore, GuildChannelStore, QuestsStore, RunningGameStore } from "./stores";
+import { ChannelStore, GuildChannelStore, QuestsStore, RunningGameStore, SuperPropertiesStore, UserStore } from "./stores";
 
 const QuestApplyAction = findByCodeLazy("type:\"QUESTS_ENROLL_BEGIN\"") as (questId: string, action: QuestAction) => Promise<any>;
 const QuestLocationMap = findByPropsLazy("QUEST_HOME_DESKTOP", "11") as Record<string, any>;
@@ -22,6 +22,125 @@ let completableQuests: QuestValue[] = [];
 const completingQuest = new Map();
 const fakeGames = new Map();
 const fakeApplications = new Map();
+
+// 12 client-mod / DevTools detection bits in libdiscore-wasm generateLaunchSignature (MSB-first 0..127)
+const CLIENT_MOD_DETECTION_BITS = [0, 19, 27, 36, 43, 52, 66, 72, 79, 89, 103, 116];
+
+let restoreStackGetter: (() => void) | null = null;
+
+function scrubLaunchSignatureUuid(uuid: string | undefined | null): string | undefined | null {
+    if (typeof uuid !== "string" || uuid.length !== 36) return uuid;
+    const hex = uuid.replace(/-/g, "");
+    if (hex.length !== 32) return uuid;
+    try {
+        let val = BigInt("0x" + hex);
+        for (const bit of CLIENT_MOD_DETECTION_BITS) {
+            val &= ~(1n << BigInt(127 - bit));
+        }
+        const cleanHex = val.toString(16).padStart(32, "0");
+        return `${cleanHex.slice(0, 8)}-${cleanHex.slice(8, 12)}-${cleanHex.slice(12, 16)}-${cleanHex.slice(16, 20)}-${cleanHex.slice(20, 32)}`;
+    } catch {
+        return uuid;
+    }
+}
+
+function scrubCachedSuperProperties() {
+    try {
+        const props = SuperPropertiesStore?.getSuperProperties?.();
+        if (props?.launch_signature) {
+            props.launch_signature = scrubLaunchSignatureUuid(props.launch_signature);
+        }
+        if (props && "has_client_mods" in props) {
+            props.has_client_mods = false;
+        }
+    } catch {}
+}
+
+function installStackTraceSanitizer() {
+    if (restoreStackGetter) return;
+    try {
+        const origDesc = Object.getOwnPropertyDescriptor(Error.prototype, "stack");
+        if (origDesc?.get) {
+            const origGet = origDesc.get;
+            const cleanGet = function (this: Error) {
+                const raw = origGet.call(this);
+                if (typeof raw !== "string") return raw;
+                return raw
+                    .split("\n")
+                    .filter(line => !/vencord|betterdiscord|completediscordquest|<anonymous>|eval at/i.test(line))
+                    .join("\n");
+            };
+            Object.defineProperty(Error.prototype, "stack", { ...origDesc, get: cleanGet });
+            restoreStackGetter = () => {
+                Object.defineProperty(Error.prototype, "stack", origDesc);
+                restoreStackGetter = null;
+            };
+        }
+    } catch {}
+}
+
+// Module 973522 (o.Ic) 2-segment executable_path formatter
+function formatQuestExecutablePath(exePath: string | undefined | null): string | null {
+    if (!exePath || typeof exePath !== "string") return null;
+    return exePath.toLowerCase().replace(/\\/g, "/").split("/").filter(Boolean).slice(-2).join("/");
+}
+
+// Port of discord_utils.node sub_a3990 + sub_a4120 + sub_1350 (146-byte 0x92 struct -> 196-char Base64 executableFingerprint)
+async function synthesizeSignedExecutableFingerprint(userId: string, appId: string, exePath: string, realGames: any[] = []): Promise<string> {
+    const enc = new TextEncoder();
+    const sha256 = async (text: string) => new Uint8Array(await crypto.subtle.digest("SHA-256", enc.encode(text)));
+
+    const xorKey = await sha256(String(userId ?? "") + "https://discord.com/careers");
+
+    let harvestedHwTail: Uint8Array | null = null;
+    try {
+        const candidates = [
+            ...realGames,
+            ...(RunningGameStore?.getGamesSeen?.(false) ?? []),
+            ...(RunningGameStore?.getCandidateGames?.() ?? [])
+        ];
+        const existingFp = candidates.find(g => typeof g?.executableFingerprint === "string" && g.executableFingerprint.length === 196)?.executableFingerprint;
+        if (existingFp) {
+            const raw = Uint8Array.from(atob(existingFp), c => c.charCodeAt(0));
+            if (raw.length === 0x92) {
+                const plain = new Uint8Array(0x92);
+                for (let i = 0; i < 0x92; i++) plain[i] = raw[i] ^ xorKey[i & 31];
+                if (plain[0] === 0x01) {
+                    harvestedHwTail = plain.slice(0x4A, 0x72);
+                }
+            }
+        }
+    } catch {}
+
+    const seed = `${appId}:${formatQuestExecutablePath(exePath) ?? exePath}`;
+    const h64k = await sha256("pe64k:" + seed);
+    const hSpki = await sha256("spki:" + seed);
+    const hCert = await sha256("cert:" + seed);
+    const hHw = await sha256("hw:" + navigator.userAgent + ":" + (navigator.hardwareConcurrency || 8));
+
+    const buf = new Uint8Array(0x92);
+    buf[0x00] = 0x01; // Version = 1
+    buf[0x01] = 0x09; // Flags = is_signed (0x01) | is_gui_window (0x08)
+
+    const sizeView = new DataView(buf.buffer);
+    const fileSize = 67108864 + ((h64k[0] | (h64k[1] << 8) | (h64k[2] << 16)) % 73400320);
+    sizeView.setBigUint64(0x02, BigInt(fileSize), true);
+
+    buf.set(h64k, 0x0A);
+    buf.set(hSpki, 0x2A);
+    if (harvestedHwTail && harvestedHwTail.length === 40) {
+        buf.set(harvestedHwTail, 0x4A);
+    } else {
+        buf.set(hHw, 0x4A);
+    }
+    buf.set(hCert, 0x72);
+
+    const out = new Uint8Array(0x92);
+    for (let i = 0; i < 0x92; i++) out[i] = buf[i] ^ xorKey[i & 31];
+    let binary = "";
+    for (let i = 0; i < out.length; i++) binary += String.fromCharCode(out[i]);
+    return btoa(binary);
+}
 
 const CONSENT_WARNING = [
     "Important Notice",
@@ -35,7 +154,7 @@ const CONSENT_WARNING = [
 
 export default definePlugin({
     name: "CompleteDiscordQuest",
-    description: "A plugin that completes multiple discord quests in background simultaneously.",
+    description: "A plugin that completes multiple discord quests in background simultaneously (Stealth Hardened).",
     authors: [{
         name: "nicola02nb",
         id: 257900031351193600n
@@ -68,8 +187,8 @@ export default definePlugin({
             group: true,
             replacement: [
                 {
-                    match: /}getRunningGames\(\){return/,
-                    replace: "}getRunningGames(){const games=$self.getRunningGames();return games ? games : "
+                    match: /}getRunningGames\(\){return ([^}]+)}/,
+                    replace: "}getRunningGames(){return $self.getRunningGames($1)}"
                 },
                 {
                     match: /}getGameForPID\((\i)\){/,
@@ -83,6 +202,13 @@ export default definePlugin({
                 match: /}getStreamerActiveStreamMetadata\(\){/,
                 replace: "}getStreamerActiveStreamMetadata(){const metadata=$self.getStreamerActiveStreamMetadata();if(metadata){return metadata;}"
             }
+        },
+        {
+            find: "launchSignature:",
+            replacement: {
+                match: /launchSignature:(\i)\(\)/,
+                replace: "launchSignature:$self.scrubLaunchSignature($1())"
+            }
         }
     ],
     start: () => {
@@ -91,12 +217,21 @@ export default definePlugin({
             return;
         }
 
+        installStackTraceSanitizer();
+        scrubCachedSuperProperties();
         QuestsStore.addChangeListener(updateQuests);
         updateQuests();
     },
     stop: () => {
         QuestsStore.removeChangeListener(updateQuests);
         stopAllFarming();
+        if (restoreStackGetter) {
+            restoreStackGetter();
+        }
+    },
+
+    scrubLaunchSignature(sig: string) {
+        return scrubLaunchSignatureUuid(sig);
     },
 
     renderQuestButtonTopBar() {
@@ -123,10 +258,18 @@ export default definePlugin({
         return questButton;
     },
 
-    getRunningGames() {
-        if (fakeGames.size > 0) {
-            return Array.from(fakeGames.values());
+    getRunningGames(realGames?: any[]) {
+        const base = Array.isArray(realGames) ? realGames : [];
+        if (fakeGames.size === 0) {
+            return base;
         }
+        const merged = base.slice();
+        for (const fake of fakeGames.values()) {
+            if (!merged.some(g => g && (String(g.id) === String(fake.id) || g.pid === fake.pid))) {
+                merged.push(fake);
+            }
+        }
+        return merged;
     },
 
     getGameForPID(pid) {
@@ -185,6 +328,7 @@ function updateQuests() {
         return;
     }
 
+    scrubCachedSuperProperties();
     availableQuests = [...QuestsStore.quests.values()];
     acceptableQuests = availableQuests.filter(x => x.userStatus?.enrolledAt == null && new Date(x.config.expiresAt).getTime() > Date.now()) || [];
     completableQuests = availableQuests.filter(x => x.userStatus?.enrolledAt && !x.userStatus?.completedAt && new Date(x.config.expiresAt).getTime() > Date.now()) || [];
@@ -202,9 +346,6 @@ function updateQuests() {
             completeQuest(quest);
         }
     }
-    /* console.log("Available quests updated:", availableQuests);
-    console.log("Acceptable quests updated:", acceptableQuests);
-    console.log("Completable quests updated:", completableQuests); */
 }
 
 function acceptQuest(quest: QuestValue) {
@@ -238,7 +379,7 @@ function stopAllFarming() {
         const removedGames = Array.from(fakeGames.values());
         fakeGames.clear();
         const games = RunningGameStore.getRunningGames();
-        FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: removedGames, added: games, games });
+        FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: removedGames, added: [], games });
     }
 
     if (fakeApplications.size > 0) {
@@ -257,7 +398,7 @@ function completeQuest(quest: QuestValue) {
     if (!quest) {
         console.log("You don't have any uncompleted quests!");
     } else {
-        const pid = Math.floor(Math.random() * 30000) + 1000;
+        const pid = Math.floor(Math.random() * 30000) + 4000;
 
         const applicationId = quest.config.application.id;
         const applicationName = quest.config.application.name;
@@ -299,7 +440,9 @@ function completeQuest(quest: QuestValue) {
                         }
 
                         if (diff >= speed) {
-                            const res = await RestAPI.post({ url: `/quests/${quest.id}/video-progress`, body: { timestamp: Math.min(secondsNeeded, timestamp + Math.random()) } });
+                            const jitter = 0.12 + Math.random() * 0.76;
+                            const reportedTs = Number(Math.min(secondsNeeded - 0.01, timestamp + jitter).toFixed(3));
+                            const res = await RestAPI.post({ url: `/quests/${quest.id}/video-progress`, body: { timestamp: reportedTs } });
                             completed = res.body.completed_at != null;
                             secondsDone = Math.min(secondsNeeded, timestamp);
                         }
@@ -311,7 +454,8 @@ function completeQuest(quest: QuestValue) {
                         await new Promise(resolve => setTimeout(resolve, interval * 1000));
                     }
                     if (!completed) {
-                        await RestAPI.post({ url: `/quests/${quest.id}/video-progress`, body: { timestamp: secondsNeeded } });
+                        const finalTs = Number((secondsNeeded - (0.02 + Math.random() * 0.15)).toFixed(3));
+                        await RestAPI.post({ url: `/quests/${quest.id}/video-progress`, body: { timestamp: finalTs } });
                     }
                     console.log("Quest completed!");
                 };
@@ -320,27 +464,43 @@ function completeQuest(quest: QuestValue) {
                 break;
 
             case "PLAY_ON_DESKTOP":
-                RestAPI.get({ url: `/applications/public?application_ids=${applicationId}` }).then(res => {
+                RestAPI.get({ url: `/applications/public?application_ids=${applicationId}` }).then(async res => {
                     const appData = res.body[0];
-                    const exeName = appData.executables?.find(x => x.os === "win32")?.name?.replace(">","") ?? appData.name.replace(/[\/\\:*?"<>|]/g, "");
+                    const rawExe = appData.executables?.find(x => x.os === "win32")?.name?.replace(/^>+/, "") ?? `${appData.name.replace(/[\/\\:*?"<>|]/g, "")}.exe`;
+                    const cleanAppFolder = appData.name.replace(/[\/\\:*?"<>|]/g, "").toLowerCase();
+                    const exePath = `c:/program files/${cleanAppFolder}/${rawExe}`;
+                    const exeName = rawExe.split(/[\/\\]/).pop() || rawExe;
+                    const currentRealGames = RunningGameStore.getRunningGames() ?? [];
+                    const currentUserId = UserStore?.getCurrentUser?.()?.id ?? "";
+                    const executableFingerprint = await synthesizeSignedExecutableFingerprint(currentUserId, applicationId, exePath, currentRealGames);
 
                     const fakeGame = {
-                        cmdLine: `C:\\Program Files\\${appData.name}\\${exeName}`,
+                        cmdLine: `"C:\\Program Files\\${appData.name}\\${rawExe.replace(/\//g, "\\")}"`,
+                        distributor: null,
+                        elevated: false,
                         exeName,
-                        exePath: `c:/program files/${appData.name.toLowerCase()}/${exeName}`,
+                        exePath,
+                        executableFingerprint,
+                        fullscreenType: 0,
+                        gameMetadata: undefined,
                         hidden: false,
-                        isLauncher: false,
                         id: applicationId,
+                        isLauncher: false,
+                        lastFocused: Math.floor(Date.now() / 1000),
                         name: appData.name,
+                        nativeProcessObserverId: pid,
+                        origGameName: appData.name,
                         pid: pid,
                         pidPath: [pid],
-                        processName: appData.name,
-                        start: Date.now(),
+                        processName: exeName.replace(/\.exe$/i, ""),
+                        sandboxed: false,
+                        sku: null,
+                        start: Date.now() - Math.floor(Math.random() * 8000 + 2000),
+                        windowHandle: String(pid * 4 + 65536),
                     };
-                    const realGames = fakeGames.size === 0 ? RunningGameStore.getRunningGames() : [];
                     fakeGames.set(quest.id, fakeGame);
-                    const fakeGames2 = Array.from(fakeGames.values());
-                    FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: realGames, added: [fakeGame], games: fakeGames2 });
+                    const mergedGames = RunningGameStore.getRunningGames();
+                    FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: [], added: [fakeGame], games: mergedGames });
 
                     const playOnDesktop = event => {
                         if (event.questId !== quest.id) return;
@@ -352,8 +512,7 @@ function completeQuest(quest: QuestValue) {
 
                             fakeGames.delete(quest.id);
                             const games = RunningGameStore.getRunningGames();
-                            const added = fakeGames.size === 0 ? games : [];
-                            FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: [fakeGame], added: added, games: games });
+                            FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: [fakeGame], added: [], games });
                             FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", playOnDesktop);
 
                             if (progress >= secondsNeeded) {
@@ -364,14 +523,14 @@ function completeQuest(quest: QuestValue) {
                     };
                     FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", playOnDesktop);
 
-                    console.log(`Spoofed your game to ${applicationName}. Wait for ${Math.ceil((secondsNeeded - secondsDone) / 60)} more minutes.`);
+                    console.log(`Spoofed your game to ${applicationName} (path: ${formatQuestExecutablePath(exePath)}, 196-char signed executableFingerprint attached). Wait for ${Math.ceil((secondsNeeded - secondsDone) / 60)} more minutes.`);
                 });
                 break;
 
             case "STREAM_ON_DESKTOP":
                 const fakeApp = {
                     id: applicationId,
-                    name: `FakeApp ${applicationName} (CompleteDiscordQuest)`,
+                    name: applicationName,
                     pid: pid,
                     sourceName: null,
                 };
@@ -401,29 +560,35 @@ function completeQuest(quest: QuestValue) {
                 break;
 
             case "PLAY_ACTIVITY":
-                const channelId = ChannelStore.getSortedPrivateChannels()[0]?.id ?? Object.values(GuildChannelStore.getAllGuilds()).find(x => x != null && x.VOCAL.length > 0).VOCAL[0].channel.id;
-                const streamKey = `call:${channelId}:1`;
+                const channelId = ChannelStore.getSortedPrivateChannels()[0]?.id ?? Object.values(GuildChannelStore.getAllGuilds()).find(x => x != null && x.VOCAL.length > 0)?.VOCAL?.[0]?.channel?.id;
+                const streamKey = channelId ? `call:${channelId}:1` : undefined;
 
                 const playActivity = async () => {
                     console.log("Completing quest", questName, "-", quest.config.messages.questName);
 
                     while (true) {
-                        const res = await RestAPI.post({ url: `/quests/${quest.id}/heartbeat`, body: { stream_key: streamKey, terminal: false } });
-                        const progress = res.body.progress.PLAY_ACTIVITY.value;
+                        const body = applicationId
+                            ? { application_id: applicationId, terminal: false }
+                            : { stream_key: streamKey, terminal: false };
+                        const res = await RestAPI.post({ url: `/quests/${quest.id}/heartbeat`, body });
+                        const progress = res.body?.progress?.PLAY_ACTIVITY?.value ?? 0;
                         console.log(`Quest progress ${questName}: ${progress}/${secondsNeeded}`);
 
-                        await new Promise(resolve => setTimeout(resolve, 20 * 1000));
-
-                        if (!completingQuest.get(quest.id) || progress >= secondsNeeded) {
+                        if (!completingQuest.get(quest.id) || progress >= secondsNeeded || res.body?.completed_at != null) {
                             console.log("Stopping completing quest:", questName);
 
-                            if (progress >= secondsNeeded) {
-                                await RestAPI.post({ url: `/quests/${quest.id}/heartbeat`, body: { stream_key: streamKey, terminal: true } });
+                            if (progress >= secondsNeeded || res.body?.completed_at != null) {
+                                const termBody = applicationId
+                                    ? { terminal: true }
+                                    : { stream_key: streamKey, terminal: true };
+                                await RestAPI.post({ url: `/quests/${quest.id}/heartbeat`, body: termBody });
                                 console.log("Quest completed!");
                                 completingQuest.set(quest.id, false);
                             }
                             break;
                         }
+
+                        await new Promise(resolve => setTimeout(resolve, (60 * 1000) + Math.floor(Math.random() * 1500)));
                     }
                 };
                 playActivity();
