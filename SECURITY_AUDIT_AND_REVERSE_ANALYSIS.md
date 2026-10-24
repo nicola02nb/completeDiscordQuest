@@ -35,7 +35,7 @@ When a real game is detected by Discord's native process observer (`setObservedG
 ### 2.2 Stream Obfuscation (`sub_1350` at `0x180001350` & `sub_116790` at `0x180116790`)
 
 Before returning `executableFingerprint` to JavaScript (`RunningGameStore`), `sub_1350` derives a 32-byte key:
-$$\text{Key} = \text{SHA-256}(\text{userId} \mathbin{\Vert} \text{"https://discord.com/careers"})$$
+$$\text{Key} = \text{SHA-256}(\text{userId} \mathbin{\Vert} \text{"https:}\text{//discord.com/careers"})$$
 keeps byte `0x00` (`version = 0x01`) un-XORed, and XORs bytes `i = 1..145` (`0x01..0x91`):
 $$\text{cipher}[0] = 1, \quad \text{cipher}[i] = \text{plain}[i] \oplus \text{Key}[(i - 1) \bmod 32] \quad (1 \le i \le 145)$$
 Finally, `sub_116790` Base64-encodes the 146-byte buffer into a **196-character string** (`executableFingerprint`).
@@ -144,3 +144,12 @@ Every API request includes `X-Super-Properties` (Base64 JSON). Inside `libdiscor
    - Preserves realistic millisecond float precision (`f64`) on `/video-progress`, merges spoofed games non-destructively with all 22 `RunningGameStore` schema keys, and retains a 15-second PID tombstone in `getGameForPID` so `OverlayRenderStore` never logs `untracked pid` warnings on teardown.
 5. **Sealed Metadata Auto-Fetch (`metadata_sealed` / `traffic_metadata_sealed`), `ACHIEVEMENT_IN_ACTIVITY` Support, & Configurable Multi-Platform Auto-Claim (`rewardPlatformPriority`):**
    - Automatically triggers Discord's internal Quest Decision / Current Quests fetchers in the background and backfills `metadata_sealed`, `traffic_metadata_raw`, and `traffic_metadata_sealed` from `QuestsStore` and `AdDeliveryStore` on `/enroll` and `/claim-reward`; supports `ACHIEVEMENT_IN_ACTIVITY` and `PLAY_ACTIVITY` heartbeats with `stream_key` + `application_id`; and automatically selects the preferred reward platform (`PC -> PS5 -> Xbox -> Switch`) on multi-platform `REWARD_CODE` quests.
+
+---
+
+## 6. Reference Implementations & Patches
+
+- **Flagship Repository (Console Script, Vencord Plugins, Python CLI & Full IDA Write-up):** [`ccsimplyspolit/discord-quest-stealth`](https://github.com/ccsimplyspolit/discord-quest-stealth)
+- **Standalone Console Script & Full Audit Gist:** [`ccsimplyspolit/CompleteDiscordQuest.md`](https://gist.github.com/ccsimplyspolit/f323e1b626dff79bfc08b24bc3dc27bd)
+- **Vencord Plugin Implementation:** [`ccsimplyspolit/completeDiscordQuest`](https://github.com/ccsimplyspolit/completeDiscordQuest) (Upstream PR: [`nicola02nb/completeDiscordQuest#28`](https://github.com/nicola02nb/completeDiscordQuest/pull/28))
+- **Rust / Tauri / CDP Implementation:** [`ccsimplyspolit/discord-quest-helper`](https://github.com/ccsimplyspolit/discord-quest-helper) (Upstream PR: [`Masterain98/discord-quest-helper#218`](https://github.com/Masterain98/discord-quest-helper/pull/218))

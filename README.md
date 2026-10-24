@@ -9,6 +9,8 @@
 > 3. **Self-Identifying `FakeApp ... (CompleteDiscordQuest)` String & Destructive `RunningGameStore` Replacement:** `STREAM_ON_DESKTOP` injected `"FakeApp ... (CompleteDiscordQuest)"` into `ApplicationStreamingStore`, and `getRunningGames()` wiped out all real running games instead of merging them with full 22-key native scanner schemas.
 >
 > See [`SECURITY_AUDIT_AND_REVERSE_ANALYSIS.md`](./SECURITY_AUDIT_AND_REVERSE_ANALYSIS.md) for the complete IDA / binary reverse-engineering report and applied stealth mitigations.
+>
+> **Flagship Suite (Console Script, Vencord Plugins, Python CLI & Full IDA Write-up):** [`ccsimplyspolit/discord-quest-stealth`](https://github.com/ccsimplyspolit/discord-quest-stealth)
 
 # CompleteDiscordQuest for Vencord (Stealth Hardened)
 
