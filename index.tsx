@@ -299,6 +299,14 @@ const REAL_PE_PROFILES: Record<string, {
         hdrSha256: "e809d7e33272567b5d2525f324cf5bd33555471e080b46df8c58d26590e21883",
         secSha256: "c602de1c1277db5de20b3753cd0074071fedc69bdca6f5f0a4b8b1661d3d7d9b",
     },
+    "age of empires iv/reliccardinal.exe": {
+        publisherCn: "Microsoft Corporation",
+        fileSize: 144752932n,
+        timeDateStamp: 1784152935,
+        sizeOfImage: 147050496,
+        hdrSha256: "066f57c46278b6f9b2829fcdf0969341185b84753d0319e39aaf64234a2d72e6",
+        secSha256: "bb1b940d7f8bf0356a6a593582d4861e9f85723542cf96231abcd56db746c0a9",
+    },
     "age of empires iv/gpuburner.exe": {
         publisherCn: "Microsoft Corporation",
         fileSize: 51616064n,
@@ -392,7 +400,7 @@ async function synthesizeSignedExecutableFingerprint(
                     const sizeOfImage = dv.getUint32(0x0E, true);
                     const validFlags = (flags & 0xFC) === 0 && (flags & 0x01) !== 0;
                     const validFileSize = fileSizeHigh === 0 && fileSizeLow >= 1024;
-                    const validTds = tds >= 0x40000000 && tds <= 0x80000000;
+                    const validTds = tds >= 0x386D4380;
                     const validImage = sizeOfImage >= 0x1000 && (sizeOfImage & 0xFFF) === 0;
                     if (validFlags && validFileSize && validTds && validImage) {
                         harvestedHw = plain.slice(0x32, 0x52);

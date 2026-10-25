@@ -35,9 +35,13 @@ When a real game is detected by Discord's native process observer (`setObservedG
 ### 2.2 Stream Obfuscation (`sub_1350` at `0x180001350` & `sub_116790` at `0x180116790`)
 
 Before returning `executableFingerprint` to JavaScript (`RunningGameStore`), `sub_1350` derives a 32-byte key:
+
 $$\text{Key} = \text{SHA-256}(\text{userId} \mathbin{\Vert} \text{"https:}\text{//discord.com/careers"})$$
+
 keeps byte `0x00` (`version = 0x01`) un-XORed, and XORs bytes `i = 1..145` (`0x01..0x91`):
+
 $$\text{cipher}[0] = 1, \quad \text{cipher}[i] = \text{plain}[i] \oplus \text{Key}[(i - 1) \bmod 32] \quad (1 \le i \le 145)$$
+
 Finally, `sub_116790` Base64-encodes the 146-byte buffer into a **196-character string** (`executableFingerprint`).
 
 ---
@@ -153,3 +157,5 @@ Every API request includes `X-Super-Properties` (Base64 JSON). Inside `libdiscor
 - **Standalone Console Script & Full Audit Gist:** [`ccsimplyspolit/CompleteDiscordQuest.md`](https://gist.github.com/ccsimplyspolit/f323e1b626dff79bfc08b24bc3dc27bd)
 - **Vencord Plugin Implementation:** [`ccsimplyspolit/completeDiscordQuest`](https://github.com/ccsimplyspolit/completeDiscordQuest) (Upstream PR: [`nicola02nb/completeDiscordQuest#28`](https://github.com/nicola02nb/completeDiscordQuest/pull/28))
 - **Rust / Tauri / CDP Implementation:** [`ccsimplyspolit/discord-quest-helper`](https://github.com/ccsimplyspolit/discord-quest-helper) (Upstream PR: [`Masterain98/discord-quest-helper#218`](https://github.com/Masterain98/discord-quest-helper/pull/218))
+- **Author & Security Research Portfolio:** [`@ccsimplyspolit`](https://github.com/ccsimplyspolit)
+
