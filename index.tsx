@@ -1421,6 +1421,7 @@ function completeQuest(quest: QuestValue) {
                             // Layer 3: Auto-launch Activity Frame in minimized PIP mode & drive via postMessage bridge
                             if (findActivityIframes(applicationId).length === 0 && typeof FrameManager?.launchFrame === "function") {
                                 try {
+                                    await acknowledgeActivityDisclosures(String(applicationId));
                                     console.log(`[CompleteDiscordQuest] Auto-launching minimized PIP Activity frame for ${questName} (${applicationId})...`);
                                     const launchedId = await FrameManager.launchFrame({
                                         applicationId: String(applicationId),
@@ -1667,7 +1668,64 @@ function broadcastQuestCompletedToActivityFrames(applicationId?: string | null):
     return sent;
 }
 
+/**
+ * Exact implementation of Arise Engine `module "lDfAK"` `buildRequestId(bodyStr)`
+ * Packs a 58-bit cryptographic nonce and a 64-bit tag (`FNV-1a(UTF8(bodyStr)) ^ SplitMix64(0x6c1fd93a84b7250en ^ (nonce + 0x9e3779b97f4a7c15n))`)
+ * into the 122 non-version/non-variant bits of a UUIDv4 string (`4n << 76n | 2n << 62n`).
+ */
+function buildAriseRequestId(bodyStr?: string): string {
+    const mask64 = (1n << 64n) - 1n;
+    const bitPositions: bigint[] = [];
+    for (let b = 127; b >= 0; b--) {
+        if (b !== 79 && b !== 78 && b !== 77 && b !== 76 && b !== 63 && b !== 62) {
+            bitPositions.push(BigInt(b));
+        }
+    }
+    const randBits = (bits: number): bigint => {
+        let v = 0n;
+        const bytes = crypto.getRandomValues(new Uint8Array(Math.ceil(bits / 8)));
+        for (const byte of bytes) v = (v << 8n) | BigInt(byte);
+        return v & ((1n << BigInt(bits)) - 1n);
+    };
+    const nonce58 = randBits(58);
+    let tag64: bigint;
+    if (bodyStr === undefined) {
+        tag64 = randBits(64);
+    } else {
+        let fnv = 0xcbf29ce484222325n;
+        for (const byte of new TextEncoder().encode(bodyStr)) {
+            fnv = ((fnv ^ BigInt(byte)) * 1099511628211n) & mask64;
+        }
+        let sm = (0x6c1fd93a84b7250en ^ ((nonce58 + 0x9e3779b97f4a7c15n) & mask64)) & mask64;
+        sm = ((sm ^ (sm >> 30n)) * 0xbf58476d1ce4e5b9n) & mask64;
+        sm = ((sm ^ (sm >> 27n)) * 0x94d049bb133111ebn) & mask64;
+        sm = (sm ^ (sm >> 31n)) & mask64;
+        tag64 = (fnv ^ sm) & mask64;
+    }
+    const combined122 = (nonce58 << 64n) | tag64;
+    let uuidInt = (4n << 76n) | (2n << 62n);
+    for (let i = 0; i < 122; i++) {
+        uuidInt |= ((combined122 >> BigInt(121 - i)) & 1n) << bitPositions[i];
+    }
+    const hex = uuidInt.toString(16).padStart(32, "0");
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+async function acknowledgeActivityDisclosures(applicationId: string): Promise<void> {
+    try {
+        const discRes = await RestAPI.get({ url: `/applications/${applicationId}/disclosures` }).catch(() => null);
+        const disclosures = discRes?.body?.disclosures;
+        if (Array.isArray(disclosures) && disclosures.length > 0 && !discRes?.body?.all_acked) {
+            await RestAPI.post({
+                url: `/applications/${applicationId}/disclosures`,
+                body: { disclosures }
+            }).catch(() => null);
+        }
+    } catch {}
+}
+
 async function obtainActivityOAuthCode(applicationId: string): Promise<string | null> {
+    await acknowledgeActivityDisclosures(applicationId);
     const bodies = [
         {
             permissions: "0",
@@ -1749,14 +1807,15 @@ async function tryCompleteAchievementActivityHeadless(
         if (!rendererCode) return false;
 
         const baseOrigin = `https://${applicationId}.discordsays.com`;
-        const buildHeaders = (token = "") => ({
+        const buildHeaders = (token = "", extra: Record<string, string> = {}) => ({
             "Content-Type": "application/json",
             "Accept": "*/*",
             "X-Auth-Token": token,
             "X-Universe-ID": "78a74ba6-b027-4b0e-a686-9a6f4124c068",
             "X-Discord-Activity-Id": String(applicationId),
             "X-Discord-Hostname": `${applicationId}.discordsays.com`,
-            "X-Arise-Client": "spades-prod-main-4835c58"
+            "X-Arise-Client": "spades-prod-main-4835c58",
+            ...extra
         });
 
         const authRes = await fetch(`${baseOrigin}/.proxy/acf/authorize`, {
@@ -1781,15 +1840,16 @@ async function tryCompleteAchievementActivityHeadless(
             }
         } catch {}
 
+        const titleBody = JSON.stringify({ id: "f0rsaken-ace" });
         await fetch(`${baseOrigin}/.proxy/api/profileTitle/add`, {
             method: "POST",
-            headers: buildHeaders(ariseToken),
-            body: JSON.stringify({ id: "f0rsaken-ace" })
+            headers: buildHeaders(ariseToken, { "X-Request-Id": buildAriseRequestId(titleBody) }),
+            body: titleBody
         }).catch(() => null);
 
         await fetch(`${baseOrigin}/.proxy/api/profile/mission-completed`, {
             method: "POST",
-            headers: buildHeaders(ariseToken)
+            headers: buildHeaders(ariseToken, { "X-Request-Id": buildAriseRequestId(undefined) })
         }).catch(() => null);
 
         const progRes = await fetch(`${baseOrigin}/.proxy/acf/quest/progress`, {

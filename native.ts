@@ -5,7 +5,7 @@
  */
 
 import { ConnectSrc, CspPolicies } from "@main/csp";
-import { randomUUID } from "crypto";
+import { randomBytes } from "crypto";
 import { IpcMainInvokeEvent } from "electron";
 
 CspPolicies["*.discordsays.com"] = ConnectSrc;
@@ -14,6 +14,49 @@ CspPolicies["wss://*.discordsays.com"] = ConnectSrc;
 
 const DEFAULT_UNIVERSE_ID = "78a74ba6-b027-4b0e-a686-9a6f4124c068";
 const DEFAULT_ARISE_CLIENT = "spades-prod-main-4835c58";
+
+/**
+ * Exact implementation of Arise Engine `module "lDfAK"` `buildRequestId(bodyStr)`
+ * Packs a 58-bit cryptographic nonce and a 64-bit tag (`FNV-1a(UTF8(bodyStr)) ^ SplitMix64(0x6c1fd93a84b7250en ^ (nonce + 0x9e3779b97f4a7c15n))`)
+ * into the 122 non-version/non-variant bits of a UUIDv4 string (`4n << 76n | 2n << 62n`).
+ */
+function buildAriseRequestId(bodyStr?: string): string {
+    const mask64 = (1n << 64n) - 1n;
+    const bitPositions: bigint[] = [];
+    for (let b = 127; b >= 0; b--) {
+        if (b !== 79 && b !== 78 && b !== 77 && b !== 76 && b !== 63 && b !== 62) {
+            bitPositions.push(BigInt(b));
+        }
+    }
+    const randBits = (bits: number): bigint => {
+        let v = 0n;
+        const bytes = randomBytes(Math.ceil(bits / 8));
+        for (const byte of bytes) v = (v << 8n) | BigInt(byte);
+        return v & ((1n << BigInt(bits)) - 1n);
+    };
+    const nonce58 = randBits(58);
+    let tag64: bigint;
+    if (bodyStr === undefined) {
+        tag64 = randBits(64);
+    } else {
+        let fnv = 0xcbf29ce484222325n;
+        for (const byte of Buffer.from(bodyStr, "utf8")) {
+            fnv = ((fnv ^ BigInt(byte)) * 1099511628211n) & mask64;
+        }
+        let sm = (0x6c1fd93a84b7250en ^ ((nonce58 + 0x9e3779b97f4a7c15n) & mask64)) & mask64;
+        sm = ((sm ^ (sm >> 30n)) * 0xbf58476d1ce4e5b9n) & mask64;
+        sm = ((sm ^ (sm >> 27n)) * 0x94d049bb133111ebn) & mask64;
+        sm = (sm ^ (sm >> 31n)) & mask64;
+        tag64 = (fnv ^ sm) & mask64;
+    }
+    const combined122 = (nonce58 << 64n) | tag64;
+    let uuidInt = (4n << 76n) | (2n << 62n);
+    for (let i = 0; i < 122; i++) {
+        uuidInt |= ((combined122 >> BigInt(121 - i)) & 1n) << bitPositions[i];
+    }
+    const hex = uuidInt.toString(16).padStart(32, "0");
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
 
 async function discoverAriseMetadata(baseOrigin: string): Promise<{ universeId: string; appVersion: string }> {
     let universeId = DEFAULT_UNIVERSE_ID;
@@ -128,24 +171,19 @@ export async function completeActivityQuest(
             }
         } catch {}
 
-        // 3. Query quest status & record title/mission completion on Arise API
+        // 3. Record title & mission completion on Arise API using exact module "lDfAK" X-Request-Id MAC
         try {
-            await fetch(`${baseOrigin}/.proxy/acf/quest/status`, {
-                method: "GET",
-                headers: buildHeaders(acfToken),
-                signal: AbortSignal.timeout(8000)
-            }).catch(() => null);
-
+            const titleBody = JSON.stringify({ id: "f0rsaken-ace" });
             await fetch(`${baseOrigin}/.proxy/api/profileTitle/add`, {
                 method: "POST",
-                headers: buildHeaders(ariseToken, { "X-Request-Id": randomUUID() }),
-                body: JSON.stringify({ id: "f0rsaken-ace" }),
+                headers: buildHeaders(ariseToken, { "X-Request-Id": buildAriseRequestId(titleBody) }),
+                body: titleBody,
                 signal: AbortSignal.timeout(8000)
             }).catch(() => null);
 
             await fetch(`${baseOrigin}/.proxy/api/profile/mission-completed`, {
                 method: "POST",
-                headers: buildHeaders(ariseToken, { "X-Request-Id": randomUUID() }),
+                headers: buildHeaders(ariseToken, { "X-Request-Id": buildAriseRequestId(undefined) }),
                 body: undefined,
                 signal: AbortSignal.timeout(8000)
             }).catch(() => null);
