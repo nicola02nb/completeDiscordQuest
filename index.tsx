@@ -16,6 +16,7 @@ import { AdDeliveryStore, ChannelStore, GuildChannelStore, QuestsStore, RunningG
 const QuestApplyAction = findByCodeLazy("type:\"QUESTS_ENROLL_BEGIN\"") as (questId: string, action: QuestAction) => Promise<any>;
 const QuestClaimAction = findByCodeLazy("type:\"QUESTS_CLAIM_REWARD_BEGIN\"") as (questId: string, platform: number, location: number) => Promise<any>;
 const QuestLocationMap = findByPropsLazy("QUEST_HOME_DESKTOP", "11") as Record<string, any>;
+const FrameManager = findByPropsLazy("launchFrame", "updateFrameLayoutMode") as Record<string, any>;
 
 let availableQuests: QuestValue[] = [];
 let acceptableQuests: QuestValue[] = [];
@@ -652,6 +653,13 @@ export default definePlugin({
             replacement: {
                 match: /launch_signature:(\i)(?!\.)/g,
                 replace: "launch_signature:$self.scrubLaunchSignature($1)"
+            }
+        },
+        {
+            find: "\"No eligible quests found\"",
+            replacement: {
+                match: /null==(\i)\.enrolled_at\?1:null==(\i)\.enrolled_at\?-1:/,
+                replace: "null==$1.enrolled_at?1:null==$2.enrolled_at?-1:($1.completed_at!=null)!==($2.completed_at!=null)?($1.completed_at!=null?1:-1):"
             }
         }
     ],
@@ -1367,11 +1375,93 @@ function completeQuest(quest: QuestValue) {
                 const streamKey = `call:${channelId}:1`;
 
                 const runActivityQuest = async () => {
+                    const restoreSiblings = isAchievementTask
+                        ? deprioritizeCompletedSiblingQuests(quest.id, applicationId)
+                        : () => {};
+                    let autoLaunchedFrameId: string | null = null;
                     try {
                         console.log(`Completing activity quest ${questName} (${taskName}, app=${applicationId ?? "none"})`);
                         try {
                             FluxDispatcher.dispatch({ type: "QUEST_APPLICATION_START_TIMER", questId: quest.id });
                         } catch {}
+
+                        if (isAchievementTask && applicationId) {
+                            try {
+                                await RestAPI.post({
+                                    url: `/applications/${applicationId}/proxy-ticket`,
+                                    body: {}
+                                }).catch(() => null);
+                            } catch {}
+
+                            // Layer 1: If an Activity iframe is already mounted in the DOM, broadcast completion immediately
+                            const initialFrames = broadcastQuestCompletedToActivityFrames(applicationId);
+                            if (initialFrames > 0) {
+                                console.log(`[CompleteDiscordQuest] Broadcasted quest-completed to ${initialFrames} active frame(s) for ${questName}.`);
+                            }
+
+                            // Layer 2: Headless OAuth2 code exchange + Activity backend API completion (/.proxy/acf/authorize -> /.proxy/acf/quest/progress)
+                            const headlessOk = await tryCompleteAchievementActivityHeadless(quest.id, String(applicationId), secondsNeeded);
+                            if (headlessOk) {
+                                await new Promise(resolve => setTimeout(resolve, 1500));
+                                const verified = await refreshQuestCompletionState(quest.id, taskName, secondsNeeded);
+                                if (verified || headlessOk) {
+                                    console.log(`[CompleteDiscordQuest] Completed interactive activity quest headlessly: ${questName}`);
+                                    completingQuest.set(quest.id, true);
+                                    setTimeout(() => {
+                                        if (!quest.userStatus?.completedAt) {
+                                            completingQuest.set(quest.id, false);
+                                        }
+                                        updateQuests();
+                                    }, 8000);
+                                    setTimeout(updateQuests, 1500);
+                                    return;
+                                }
+                            }
+
+                            // Layer 3: Auto-launch Activity Frame in minimized PIP mode & drive via postMessage bridge
+                            if (findActivityIframes(applicationId).length === 0 && typeof FrameManager?.launchFrame === "function") {
+                                try {
+                                    console.log(`[CompleteDiscordQuest] Auto-launching minimized PIP Activity frame for ${questName} (${applicationId})...`);
+                                    const launchedId = await FrameManager.launchFrame({
+                                        applicationId: String(applicationId),
+                                        surface: { type: 0 },
+                                        showErrorModal: false
+                                    });
+                                    autoLaunchedFrameId = typeof launchedId === "string" ? launchedId : `main:${applicationId}`;
+                                    FrameManager.updateFrameLayoutMode?.({
+                                        frameId: autoLaunchedFrameId,
+                                        layoutMode: 1 // PIP minimized
+                                    });
+                                } catch (launchErr) {
+                                    console.warn(`[CompleteDiscordQuest] Auto-launch frame fallback notice for ${questName}:`, launchErr);
+                                }
+                            }
+
+                            for (let cycle = 0; cycle < 12; cycle++) {
+                                if (!completingQuest.get(quest.id)) break;
+                                await new Promise(resolve => setTimeout(resolve, 6500));
+                                if (!completingQuest.get(quest.id)) break;
+
+                                broadcastQuestCompletedToActivityFrames(applicationId);
+                                if (cycle === 2 || cycle === 6) {
+                                    await tryCompleteAchievementActivityHeadless(quest.id, String(applicationId), secondsNeeded).catch(() => false);
+                                }
+
+                                const doneNow = await refreshQuestCompletionState(quest.id, taskName, secondsNeeded);
+                                if (doneNow) {
+                                    console.log(`Quest completed: ${questName}`);
+                                    completingQuest.set(quest.id, true);
+                                    setTimeout(() => {
+                                        if (!quest.userStatus?.completedAt) {
+                                            completingQuest.set(quest.id, false);
+                                        }
+                                        updateQuests();
+                                    }, 8000);
+                                    setTimeout(updateQuests, 1500);
+                                    return;
+                                }
+                            }
+                        }
 
                         let stagnantCycles = 0;
                         let lastProgress = secondsDone;
@@ -1380,6 +1470,10 @@ function completeQuest(quest: QuestValue) {
                             if (!completingQuest.get(quest.id)) {
                                 completingQuest.set(quest.id, false);
                                 break;
+                            }
+
+                            if (isAchievementTask && applicationId) {
+                                broadcastQuestCompletedToActivityFrames(applicationId);
                             }
 
                             const body: Record<string, any> = {
@@ -1486,6 +1580,17 @@ function completeQuest(quest: QuestValue) {
                             attemptedAchievementQuestIds.add(quest.id);
                         }
                         completingQuest.set(quest.id, false);
+                    } finally {
+                        if (autoLaunchedFrameId && applicationId) {
+                            try {
+                                FluxDispatcher.dispatch({
+                                    type: "FRAME_STOP",
+                                    applicationId: String(applicationId),
+                                    frameId: autoLaunchedFrameId
+                                });
+                            } catch {}
+                        }
+                        restoreSiblings();
                     }
                 };
                 runActivityQuest();
@@ -1502,3 +1607,224 @@ function completeQuest(quest: QuestValue) {
         completingQuest.set(quest.id, false);
     }
 }
+
+function deprioritizeCompletedSiblingQuests(activeQuestId: string, applicationId?: string | null): () => void {
+    const originalEnrolledAt = new Map<any, string>();
+    try {
+        const questsMap = QuestsStore?.quests;
+        if (!questsMap || typeof questsMap.values !== "function") return () => {};
+        for (const q of questsMap.values()) {
+            if (!q || q.id === activeQuestId) continue;
+            if (q.userStatus?.completedAt != null && typeof q.userStatus?.enrolledAt === "string") {
+                const tc = q.config?.taskConfig ?? q.config?.taskConfigV2;
+                const tasksObj = tc?.tasks ? Object.values(tc.tasks) : [];
+                const matchesApp =
+                    !applicationId ||
+                    String(q.config?.application?.id) === String(applicationId) ||
+                    tasksObj.some((t: any) => Array.isArray(t?.applications) && t.applications.some((a: any) => String(a?.id) === String(applicationId)));
+                if (matchesApp) {
+                    originalEnrolledAt.set(q.userStatus, q.userStatus.enrolledAt);
+                    q.userStatus.enrolledAt = "2099-01-01T00:00:00.000Z";
+                }
+            }
+        }
+    } catch {}
+    return () => {
+        for (const [statusObj, origVal] of originalEnrolledAt.entries()) {
+            try {
+                statusObj.enrolledAt = origVal;
+            } catch {}
+        }
+        originalEnrolledAt.clear();
+    };
+}
+
+function findActivityIframes(applicationId?: string | null): HTMLIFrameElement[] {
+    try {
+        const allIframes = Array.from(document.querySelectorAll("iframe"));
+        return allIframes.filter(iframe => {
+            const src = String(iframe?.src || "");
+            if (!src.includes("discordsays.com")) return false;
+            return !applicationId || src.includes(String(applicationId));
+        });
+    } catch {
+        return [];
+    }
+}
+
+function broadcastQuestCompletedToActivityFrames(applicationId?: string | null): number {
+    const frames = findActivityIframes(applicationId);
+    let sent = 0;
+    for (const iframe of frames) {
+        try {
+            if (iframe?.contentWindow) {
+                iframe.contentWindow.postMessage({ type: "award-title", payload: "f0rsaken-ace" }, "*");
+                iframe.contentWindow.postMessage({ type: "quest-completed" }, "*");
+                sent++;
+            }
+        } catch {}
+    }
+    return sent;
+}
+
+async function obtainActivityOAuthCode(applicationId: string): Promise<string | null> {
+    const bodies = [
+        {
+            permissions: "0",
+            authorize: true,
+            integration_type: 1,
+            location_context: { guild_id: "10000", channel_id: "10000", channel_type: 10000 }
+        },
+        {
+            permissions: "0",
+            authorize: true,
+            integration_type: 0,
+            location_context: { guild_id: "10000", channel_id: "10000", channel_type: 10000 }
+        },
+        {
+            permissions: "0",
+            authorize: true
+        }
+    ];
+    for (const body of bodies) {
+        try {
+            const res = await RestAPI.post({
+                url: "/oauth2/authorize",
+                query: {
+                    client_id: String(applicationId),
+                    response_type: "code",
+                    scope: "identify",
+                    prompt: "none",
+                    state: ""
+                },
+                body
+            });
+            const loc: string | undefined = res?.body?.location;
+            if (typeof loc === "string" && loc.includes("code=")) {
+                try {
+                    const parsed = new URL(loc);
+                    const code = parsed.searchParams.get("code");
+                    if (code) return code;
+                } catch {
+                    const m = loc.match(/[?&]code=([^&#]+)/);
+                    if (m?.[1]) return decodeURIComponent(m[1]);
+                }
+            }
+        } catch (err: any) {
+            if (err?.status === 429) {
+                const retryMs = ((err?.body?.retry_after as number) || 5) * 1000 + 500;
+                await new Promise(resolve => setTimeout(resolve, retryMs));
+            }
+        }
+    }
+    return null;
+}
+
+async function tryCompleteAchievementActivityHeadless(
+    questId: string,
+    applicationId: string,
+    target = 1
+): Promise<boolean> {
+    try {
+        const nativeHelper =
+            (VencordNative as any)?.pluginHelpers?.CompleteDiscordQuest ??
+            (VencordNative as any)?.pluginHelpers?.DiscordStealthGuard;
+
+        if (typeof nativeHelper?.completeActivityQuest === "function") {
+            const code = await obtainActivityOAuthCode(applicationId);
+            if (code) {
+                const nativeRes = await nativeHelper.completeActivityQuest(
+                    String(applicationId),
+                    String(questId),
+                    code,
+                    target
+                ).catch(() => null);
+                if (nativeRes?.ok) {
+                    return true;
+                }
+            }
+        }
+
+        const rendererCode = await obtainActivityOAuthCode(applicationId);
+        if (!rendererCode) return false;
+
+        const baseOrigin = `https://${applicationId}.discordsays.com`;
+        const buildHeaders = (token = "") => ({
+            "Content-Type": "application/json",
+            "Accept": "*/*",
+            "X-Auth-Token": token,
+            "X-Universe-ID": "78a74ba6-b027-4b0e-a686-9a6f4124c068",
+            "X-Discord-Activity-Id": String(applicationId),
+            "X-Discord-Hostname": `${applicationId}.discordsays.com`,
+            "X-Arise-Client": "spades-prod-main-4835c58"
+        });
+
+        const authRes = await fetch(`${baseOrigin}/.proxy/acf/authorize`, {
+            method: "POST",
+            headers: buildHeaders(""),
+            body: JSON.stringify({ code: rendererCode, activityId: String(applicationId) })
+        });
+        if (!authRes.ok) return false;
+        const authData: any = await authRes.json().catch(() => null);
+        const acfToken: string = authData?.token || authData?.authToken || "";
+        if (!acfToken) return false;
+
+        let ariseToken = acfToken;
+        try {
+            const regRes = await fetch(`${baseOrigin}/.proxy/acf/arise/register`, {
+                method: "POST",
+                headers: buildHeaders(acfToken)
+            });
+            if (regRes.ok) {
+                const regData: any = await regRes.json().catch(() => null);
+                if (regData?.authToken) ariseToken = regData.authToken;
+            }
+        } catch {}
+
+        await fetch(`${baseOrigin}/.proxy/api/profileTitle/add`, {
+            method: "POST",
+            headers: buildHeaders(ariseToken),
+            body: JSON.stringify({ id: "f0rsaken-ace" })
+        }).catch(() => null);
+
+        await fetch(`${baseOrigin}/.proxy/api/profile/mission-completed`, {
+            method: "POST",
+            headers: buildHeaders(ariseToken)
+        }).catch(() => null);
+
+        const progRes = await fetch(`${baseOrigin}/.proxy/acf/quest/progress`, {
+            method: "POST",
+            headers: buildHeaders(acfToken),
+            body: JSON.stringify({ progress: Math.max(1, Number(target) || 1), quest_id: String(questId) })
+        });
+        if (!progRes.ok) return false;
+        const progData: any = await progRes.json().catch(() => null);
+        return progData?.status === "ok" || progData?.success !== false;
+    } catch {
+        return false;
+    }
+}
+
+async function refreshQuestCompletionState(questId: string, taskName: string, target: number): Promise<boolean> {
+    try {
+        const checkStore = () => {
+            const q = QuestsStore?.getQuest?.(questId) ?? QuestsStore?.quests?.get?.(questId);
+            if (!q) return false;
+            const val = (q.userStatus?.progress as any)?.[taskName]?.value
+                ?? (q.userStatus?.progress as any)?.ACHIEVEMENT_IN_ACTIVITY?.value
+                ?? (q.userStatus?.progress as any)?.ACHIEVEMENT_IN_GAME?.value
+                ?? 0;
+            return q.userStatus?.completedAt != null || val >= target;
+        };
+        if (checkStore()) return true;
+
+        const fetchCurrentQuests = find(filters.byCode("QUESTS_FETCH_CURRENT_QUESTS_BEGIN"), { isIndirect: true });
+        if (typeof fetchCurrentQuests === "function") {
+            await Promise.resolve(fetchCurrentQuests()).catch(() => null);
+        }
+        return checkStore();
+    } catch {
+        return false;
+    }
+}
+
