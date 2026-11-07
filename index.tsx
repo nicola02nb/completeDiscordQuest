@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+import ErrorBoundary from "@components/ErrorBoundary";
 import definePlugin from "@utils/types";
 import { findByCodeLazy, findByPropsLazy } from "@webpack";
 import { FluxDispatcher, RestAPI } from "@webpack/common";
@@ -14,6 +15,10 @@ import { ChannelStore, GuildChannelStore, QuestsStore, RunningGameStore } from "
 
 const QuestApplyAction = findByCodeLazy("type:\"QUESTS_ENROLL_BEGIN\"") as (questId: string, action: QuestAction) => Promise<any>;
 const QuestLocationMap = findByPropsLazy("QUEST_HOME_DESKTOP", "11") as Record<string, any>;
+
+// rendered inside Discord's own title bar and settings bar, so a failure here must not take the client down
+const SafeQuestButton = ErrorBoundary.wrap(QuestButton, { noop: true });
+const SafeQuestsCount = ErrorBoundary.wrap(QuestsCount, { noop: true });
 
 let availableQuests: QuestValue[] = [];
 let acceptableQuests: QuestValue[] = [];
@@ -43,7 +48,7 @@ export default definePlugin({
     settings,
     patches: [
         {
-            find: ".PlatformTypes.WEB",
+            find: "\"data-window-chrome\"",
             replacement: {
                 match: /(\((\i)\){)(let{leading)/,
                 replace: "$1$2?.trailing?.props?.children?.unshift($self.renderQuestButtonTopBar());$3"
@@ -101,24 +106,24 @@ export default definePlugin({
 
     renderQuestButtonTopBar() {
         if (settings.store.showQuestsButtonTopBar) {
-            return <QuestButton type="top-bar" />;
+            return <SafeQuestButton type="top-bar" />;
         }
     },
 
     renderQuestButtonSettingsBar() {
         if (settings.store.showQuestsButtonSettingsBar) {
-            return <QuestButton type="settings-bar" />;
+            return <SafeQuestButton type="settings-bar" />;
         }
     },
 
     renderQuestButtonBadges(questButton) {
         if (settings.store.showQuestsButtonBadges && typeof questButton === "string" && questButton === "quests") {
-            return (<QuestsCount />);
+            return (<SafeQuestsCount />);
         }
         // Experiment
         if (settings.store.showQuestsButtonBadges && questButton?.href?.startsWith("/quest-home")
-            && Array.isArray(questButton?.children) && questButton.children.findIndex(child => child?.type === QuestsCount) === -1) {
-            questButton.children.push(<QuestsCount />);
+            && Array.isArray(questButton?.children) && questButton.children.findIndex(child => child?.type === SafeQuestsCount) === -1) {
+            questButton.children.push(<SafeQuestsCount />);
         }
         return questButton;
     },
