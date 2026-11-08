@@ -143,8 +143,11 @@ export default definePlugin({
 });
 
 function isQuestEligibleForFarming(quest: QuestValue): boolean {
-    const questConfig = quest.config.taskConfig || quest.config.taskConfigV2;
-    if (!Object.keys(questConfig.tasks).some(taskName => {
+    const questConfig = getQuestTaskConfig(quest.config);
+    const taskNames = questConfig?.tasks instanceof Map
+        ? [...questConfig.tasks.keys()]
+        : Object.keys(questConfig?.tasks ?? {});
+    if (!taskNames.some(taskName => {
         return (taskName === "WATCH_VIDEO" && settings.store.farmVideos
             || taskName === "WATCH_VIDEO_ON_MOBILE" && settings.store.farmVideos
             || taskName === "PLAY_ON_DESKTOP" && settings.store.farmPlayOnDesktop
@@ -161,6 +164,14 @@ function isQuestEligibleForFarming(quest: QuestValue): boolean {
             || reward.type === 4 && settings.store.farmVirtualCurrency
             || reward.type === 5 && settings.store.farmFractionalPremium);
     });
+}
+
+function getQuestTaskConfig(config: Config): TaskConfig | TaskConfigV2 | undefined {
+    const currentTasks = config.taskConfigV2?.tasks;
+    const hasCurrentTasks = currentTasks instanceof Map
+        ? currentTasks.size > 0
+        : currentTasks != null && Object.keys(currentTasks).length > 0;
+    return hasCurrentTasks ? config.taskConfigV2 : config.taskConfig ?? config.taskConfigV2;
 }
 
 function ensureHasAcceptedToUsePlugin(): boolean {

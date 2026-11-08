@@ -53,7 +53,7 @@ interface Config {
     startsAt: string;
     expiresAt: string;
     features: number[];
-    application: Application;
+    application?: Application | null;
     assets: Assets;
     colors: Colors;
     messages: Messages;
@@ -98,12 +98,13 @@ interface TaskConfigV2 {
 }
 
 interface Tasks {
-    PLAY_ON_DESKTOP: PLAYONDESKTOP;
+    [taskName: string]: PLAYONDESKTOP | undefined;
 }
 
 interface PLAYONDESKTOP {
     type: string;
     target: number;
+    applications?: Application[];
 }
 
 interface Messages {
